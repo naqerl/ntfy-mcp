@@ -1,0 +1,140 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+    tags: ["v*"]
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  vet:
+    name: vet
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+      - run: go mod download
+      - run: make vet
+
+  test:
+    name: test
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+      - run: go mod download
+      - run: make test
+
+  build:
+    name: build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+      - name: Build linux/amd64 and linux/arm64
+        run: make build-linux
+      - name: Show artifacts
+        run: ls -lh bin/
+
+  docker:
+    name: docker
+    needs: [vet, test, build]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: read
+    services:
+      ntfy:
+        image: binwiederhier/ntfy:latest
+        command: serve
+        ports:
+          - 2586:80
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install smoke dependencies
+        run: sudo apt-get update && sudo apt-get install -y jq
+      - name: Build image
+        run: docker build --build-arg VERSION="${GITHUB_REF_NAME}" -t ntfy-mcp:ci .
+      - name: Wait for ntfy
+        run: |
+          for i in $(seq 1 60); do
+            if curl -fsS http://127.0.0.1:2586/v1/health; then
+              exit 0
+            fi
+            sleep 1
+          done
+          echo "ntfy did not become healthy" >&2
+          exit 1
+      - name: Run gateway
+        run: |
+          docker run -d --name ntfy-mcp --network host \
+            -e MCP_AUTH_TOKEN=smoke-token \
+            -e MCP_ADDR=127.0.0.1:18080 \
+            -e NTFY_BASE_URL=http://127.0.0.1:2586 \
+            -e NTFY_HEARTBEAT=2s \
+            -e NTFY_POLL_MS=250 \
+            -e NTFY_MAX_EVENTS=50 \
+            -e NTFY_STREAM_MAX=10m \
+            ntfy-mcp:ci
+      - name: Smoke test
+        env:
+          MCP_URL: http://127.0.0.1:18080/mcp
+          MCP_AUTH_TOKEN: smoke-token
+          MCP_IMAGE: ntfy-mcp:ci
+        run: ./scripts/smoke.sh
+      - name: Gateway logs
+        if: failure()
+        run: docker logs ntfy-mcp || true
+      - name: Cleanup
+        if: always()
+        run: docker rm -f ntfy-mcp || true
+
+  publish:
+    name: publish
+    if: startsWith(github.ref, 'refs/tags/v')
+    needs: [vet, test, build, docker]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - uses: actions/checkout@v4
+      - uses: docker/setup-buildx-action@v3
+      - name: Log in to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - name: Image metadata
+        id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ghcr.io/naqerl/ntfy-mcp
+          tags: |
+            type=raw,value=latest
+            type=semver,pattern={{version}}
+            type=semver,pattern={{major}}.{{minor}}
+            type=sha,prefix=sha-
+      - name: Build and push
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          platforms: linux/amd64,linux/arm64
+          push: true
+          build-args: |
+            VERSION=${{ github.ref_name }}
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}

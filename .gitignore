@@ -1,0 +1,21 @@
+# Binaries
+/bin/
+ntfy-mcp
+*.exe
+*.test
+*.out
+
+# Coverage and profiles
+coverage.txt
+coverage.html
+*.prof
+
+# Local tooling / editor
+.idea/
+.vscode/
+.DS_Store
+*.swp
+
+# Local environment
+.env
+.env.*
