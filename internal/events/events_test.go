@@ -561,6 +561,34 @@ func TestStreamOpenErrorMapsRateLimit(t *testing.T) {
 	}
 }
 
+func TestStreamUpstreamDecodeErrorIsReturned(t *testing.T) {
+	svc, closeSrv := realService(t, func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/x-ndjson")
+		w.WriteHeader(http.StatusOK)
+		rc := http.NewResponseController(w)
+		_ = rc.Flush()
+		_, _ = w.Write([]byte(`{"id":"","time":1,"event":"open","topic":"t"}` + "\n"))
+		_, _ = w.Write([]byte(`{not-json}` + "\n"))
+		_ = rc.Flush()
+		<-r.Context().Done()
+	}, Options{})
+	defer closeSrv()
+
+	cancel, notes, errs := startStream(t, svc, `{"event":"ntfy.message","filter":{"topic":"t"}}`)
+	defer cancel()
+	_ = waitNotification(t, notes, activeMethod)
+
+	select {
+	case streamErr := <-errs:
+		var rpcErr *mcpx.Error
+		if !errors.As(streamErr, &rpcErr) || rpcErr.Code != mcpx.CodeInternalError {
+			t.Fatalf("stream error = %v", streamErr)
+		}
+	case <-time.After(3 * time.Second):
+		t.Fatal("stream did not report the upstream decode error")
+	}
+}
+
 func TestOptionsDefaultsAndHeartbeatCeiling(t *testing.T) {
 	svc := New(nil, Options{Heartbeat: time.Hour, PollMS: 0, MaxEvents: 999, StreamMax: 0})
 	if svc.heartbeat != config.DefaultHeartbeat {

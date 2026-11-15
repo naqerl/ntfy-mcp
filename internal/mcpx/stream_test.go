@@ -272,6 +272,29 @@ func TestEventsStreamErrorBeforeHeadersIsJSON(t *testing.T) {
 	}
 }
 
+func TestEventsStreamErrorAfterActiveWritesErrorFrame(t *testing.T) {
+	events := &fakeEvents{stream: func(_ context.Context, _ json.RawMessage, emit func(Notification) error) error {
+		if err := emit(NewNotification("notifications/events/active", map[string]any{"cursor": "t1"})); err != nil {
+			return err
+		}
+		return NewError(CodeInternalError, "upstream reset", nil)
+	}}
+	h := testHandler(events)
+	rr := doRequest(h, http.MethodPost,
+		`{"jsonrpc":"2.0","id":11,"method":"events/stream","params":{"event":"ntfy.message","filter":{"topic":"t"}}}`,
+		"", "text/event-stream", "secret")
+	if ct := rr.Header().Get("Content-Type"); !strings.HasPrefix(ct, "text/event-stream") {
+		t.Fatalf("content-type = %q", ct)
+	}
+	body := rr.Body.String()
+	if strings.Count(body, "data: ") != 2 {
+		t.Fatalf("body = %q", body)
+	}
+	if !strings.Contains(body, `"error":{"code":-32603`) || !strings.Contains(body, `"id":11`) {
+		t.Fatalf("missing downstream error frame: %q", body)
+	}
+}
+
 func TestSingleResponseOverSSE(t *testing.T) {
 	h := testHandler(nil)
 	rr := doRequest(h, http.MethodPost, `{"jsonrpc":"2.0","id":1,"method":"ping"}`,

@@ -510,7 +510,10 @@ func (s *Service) StreamEvents(ctx context.Context, raw json.RawMessage, emit fu
 				if errors.Is(item.err, io.EOF) || ctx.Err() != nil {
 					return nil
 				}
-				return nil
+				// Report a reset connection or malformed NDJSON. The HTTP
+				// handler writes this as an SSE error frame because the active
+				// frame has already started the stream.
+				return mapUpstreamError(item.err)
 			}
 			m := item.msg
 			if m.Event != "" && m.Event != "message" {
