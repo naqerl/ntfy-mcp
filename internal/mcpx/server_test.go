@@ -310,13 +310,29 @@ func TestCapabilityNegotiation(t *testing.T) {
 		t.Fatalf("advertised extension: %v", rpcErr)
 	}
 
-	// An explicit capability set without the extension is unsupported.
+	// Every explicit capability set without the extension is unsupported.
+	for _, caps := range []string{
+		`{}`,
+		`{"extensions":null}`,
+		`{"extensions":{}}`,
+		`{"extensions":{"other":{}}}`,
+	} {
+		_, rpcErr = srv.Handle(context.Background(), Request{
+			Method: "events/poll",
+			Params: json.RawMessage(`{"_meta":{"io.modelcontextprotocol/clientCapabilities":` + caps + `}}`),
+		}, &fakeResponder{})
+		if rpcErr == nil || rpcErr.Code != CodeUnsupported {
+			t.Fatalf("capabilities %s: error = %v", caps, rpcErr)
+		}
+	}
+
+	// Explicit null is equivalent to leaving capabilities out.
 	_, rpcErr = srv.Handle(context.Background(), Request{
 		Method: "events/poll",
-		Params: json.RawMessage(`{"_meta":{"io.modelcontextprotocol/clientCapabilities":{"extensions":{"other":{}}}}}`),
+		Params: json.RawMessage(`{"event":"ntfy.message","filter":{"topic":"t"},"_meta":{"io.modelcontextprotocol/clientCapabilities":null}}`),
 	}, &fakeResponder{})
-	if rpcErr == nil || rpcErr.Code != CodeUnsupported {
-		t.Fatalf("missing extension: %v", rpcErr)
+	if rpcErr != nil {
+		t.Fatalf("null capabilities: %v", rpcErr)
 	}
 
 	// The 2026 revision is the floor.

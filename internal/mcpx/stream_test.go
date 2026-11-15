@@ -161,6 +161,24 @@ func TestParseErrorResponse(t *testing.T) {
 	}
 }
 
+func TestInvalidIDResponseUsesNull(t *testing.T) {
+	h := testHandler(nil)
+	for _, id := range []string{`{}`, `[]`, `true`} {
+		body := `{"jsonrpc":"2.0","id":` + id + `,"method":"ping"}`
+		rr := doRequest(h, http.MethodPost, body, "", "application/json", "secret")
+		var resp Response
+		if err := json.Unmarshal(rr.Body.Bytes(), &resp); err != nil {
+			t.Fatalf("%s: decode: %v", id, err)
+		}
+		if resp.Error == nil || resp.Error.Code != CodeInvalidRequest {
+			t.Fatalf("%s: response = %+v", id, resp)
+		}
+		if string(resp.ID) != "null" {
+			t.Fatalf("%s: id = %s, want null", id, resp.ID)
+		}
+	}
+}
+
 func TestNotificationsOnlyAccepted(t *testing.T) {
 	h := testHandler(nil)
 	rr := doRequest(h, http.MethodPost, `{"jsonrpc":"2.0","method":"notifications/initialized"}`,

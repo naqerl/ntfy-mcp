@@ -189,8 +189,8 @@ if [[ -n "$MCP_IMAGE" ]]; then
   echo "smoke: container image is non-root and refuses incomplete configuration"
   image_user="$(docker image inspect "$MCP_IMAGE" --format '{{.Config.User}}')"
   case "$image_user" in
-    nonroot*|65532*|"") ;;
-    *) fail "container runs as $image_user, expected non-root" ;;
+    nonroot*|65532*) ;;
+    *) fail "container runs as ${image_user:-root}, expected non-root" ;;
   esac
 
   set +e

@@ -52,6 +52,9 @@ func TestDecodeInvalidRequests(t *testing.T) {
 		if len(msgs) != 1 || msgs[0].Err == nil || msgs[0].Err.Code != CodeInvalidRequest {
 			t.Fatalf("%s: msgs = %+v", body, msgs)
 		}
+		if strings.Contains(body, `"id":{"x":1}`) && len(msgs[0].Request.ID) != 0 {
+			t.Fatalf("%s: invalid id must be cleared, got %s", body, msgs[0].Request.ID)
+		}
 	}
 }
 

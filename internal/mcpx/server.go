@@ -153,22 +153,37 @@ func (s *Server) negotiate(req Request) *Error {
 			"protocol revision is older than "+ProtocolRevision,
 			map[string]any{"feature": "protocolVersion", "value": v})
 	}
-	if len(params.Meta.ClientCapabilities) == 0 || !isExtensionMethod(req.Method) {
+	capabilities := bytes.TrimSpace(params.Meta.ClientCapabilities)
+	if len(capabilities) == 0 || !isExtensionMethod(req.Method) {
+		return nil
+	}
+	// An explicit null is equivalent to omitting the field. Any other explicit
+	// capability object must advertise the events extension.
+	if bytes.Equal(capabilities, []byte("null")) {
 		return nil
 	}
 	var caps struct {
-		Extensions map[string]json.RawMessage `json:"extensions"`
+		Extensions json.RawMessage `json:"extensions"`
 	}
-	if err := json.Unmarshal(params.Meta.ClientCapabilities, &caps); err != nil {
+	if err := json.Unmarshal(capabilities, &caps); err != nil {
 		return NewError(CodeInvalidParams,
 			"invalid io.modelcontextprotocol/clientCapabilities", nil)
 	}
-	if caps.Extensions != nil {
-		if _, ok := caps.Extensions[EventsExtension]; !ok {
-			return NewError(CodeUnsupported,
-				"client did not advertise the events extension",
-				map[string]any{"feature": EventsExtension, "value": req.Method})
-		}
+	extensions := bytes.TrimSpace(caps.Extensions)
+	if len(extensions) == 0 || bytes.Equal(extensions, []byte("null")) {
+		return NewError(CodeUnsupported,
+			"client did not advertise the events extension",
+			map[string]any{"feature": EventsExtension, "value": req.Method})
+	}
+	var advertised map[string]json.RawMessage
+	if err := json.Unmarshal(extensions, &advertised); err != nil {
+		return NewError(CodeInvalidParams,
+			"invalid io.modelcontextprotocol/clientCapabilities.extensions", nil)
+	}
+	if _, ok := advertised[EventsExtension]; !ok {
+		return NewError(CodeUnsupported,
+			"client did not advertise the events extension",
+			map[string]any{"feature": EventsExtension, "value": req.Method})
 	}
 	return nil
 }

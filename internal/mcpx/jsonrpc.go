@@ -146,14 +146,16 @@ func decodeOne(raw []byte) (Incoming, *Error) {
 	if err := json.Unmarshal(raw, &req); err != nil {
 		return Incoming{}, NewError(CodeParseError, "parse error: "+err.Error(), nil)
 	}
+	if req.HasID() && !validID(req.ID) {
+		// JSON-RPC requires id:null when the id cannot be decoded.
+		req.ID = nil
+		return Incoming{Request: req}, NewError(CodeInvalidRequest, "invalid request: id must be a string, number, or null", nil)
+	}
 	if req.JSONRPC != "2.0" {
 		return Incoming{Request: req}, NewError(CodeInvalidRequest, "invalid request: jsonrpc must be \"2.0\"", nil)
 	}
 	if req.Method == "" {
 		return Incoming{Request: req}, NewError(CodeInvalidRequest, "invalid request: method is required", nil)
-	}
-	if req.HasID() && !validID(req.ID) {
-		return Incoming{Request: req}, NewError(CodeInvalidRequest, "invalid request: id must be a string, number, or null", nil)
 	}
 	if len(req.Params) > 0 {
 		trimmed := bytes.TrimSpace(req.Params)
