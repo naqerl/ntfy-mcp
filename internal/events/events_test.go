@@ -623,3 +623,47 @@ func TestFilterMatch(t *testing.T) {
 		t.Fatal("default priority 3 matched minPriority 4")
 	}
 }
+
+func TestParseParamsAcceptsStreamEnvelope(t *testing.T) {
+	cases := []struct {
+		name string
+		raw  string
+	}{
+		{
+			name: "envelope with arguments",
+			raw:  `{"name":"ntfy.message","arguments":{"topic":"t"},"cursor":null}`,
+		},
+		{
+			name: "envelope with inline cursor",
+			raw:  `{"name":"ntfy.message","arguments":{"topic":"t"},"cursor":"abc","maxAgeMs":1000}`,
+		},
+		{
+			name: "flat form still works",
+			raw:  `{"event":"ntfy.message","topic":"t"}`,
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			p, rpcErr := parseParams(json.RawMessage(tc.raw))
+			if rpcErr != nil {
+				t.Fatalf("parseParams(%s) error = %v", tc.raw, rpcErr)
+			}
+			if p.Event != EventName {
+				t.Fatalf("event = %q", p.Event)
+			}
+			if p.Filter == nil || p.Filter.Topic != "t" {
+				t.Fatalf("filter = %+v", p.Filter)
+			}
+		})
+	}
+}
+
+func TestParseParamsRejectsEnvelopeWithoutArguments(t *testing.T) {
+	_, rpcErr := parseParams(json.RawMessage(`{"name":"ntfy.message"}`))
+	if rpcErr == nil {
+		t.Fatal("expected an error for a missing arguments object")
+	}
+	if rpcErr.Code != mcpx.CodeNotFound {
+		t.Fatalf("code = %d", rpcErr.Code)
+	}
+}
