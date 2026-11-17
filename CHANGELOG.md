@@ -4,6 +4,29 @@ All notable changes to this project are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and this project uses
 [semantic versioning](https://semver.org/).
 
+## [0.1.1] - 2026-11-17
+
+### Added
+
+- Legacy `initialize` handshake compatibility path so clients pinned to the
+  released MCP revision (`2025-11-25`) can attach. The server echoes the
+  client's top-level `params.protocolVersion` for `2025-11-25`, `2025-06-18`,
+  `2025-03-26` and `2024-11-05`, answers `2026-07-28` for anything else, and
+  returns the same `capabilities` and `serverInfo` objects as
+  `server/discover`.
+- `notifications/initialized` is accepted silently: HTTP 202 with no response
+  body and no JSON-RPC error.
+- `.github/workflows/release.yml` publishes `ghcr.io/naqerl/ntfy-mcp` on `v*`
+  tags using the workflow token.
+
+### Changed
+
+- `_meta.protocolVersion` older than `2026-07-28` stays rejected (`-32026`) on
+  the native 2026 methods, but no longer applies to `initialize`.
+- `server/discover`, the events extension, bearer auth, the `resultType:
+  "complete"` shape and the two tools are unchanged; legacy clients send no
+  `_meta`, so `tools/list` and `tools/call` work for them as before.
+
 ## [v0.1.0] - 2026-11-15
 
 ### Added

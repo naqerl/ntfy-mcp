@@ -150,8 +150,8 @@ func (h *Handler) handleBatch(w http.ResponseWriter, r *http.Request, incoming [
 			continue
 		}
 		if req.IsNotification() {
-			// The 2026 protocol has no initialized handshake; notifications are
-			// tolerated but have no response body.
+			// Notifications (including the legacy notifications/initialized) have
+			// no response body; their handler result is deliberately dropped.
 			_, _ = h.server.Handle(r.Context(), req, &jsonResponder{})
 			continue
 		}
