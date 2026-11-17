@@ -15,9 +15,15 @@ not expose. Do not reintroduce the SDK just for transport convenience.
   startup. `MCP_AUTH_TOKEN` is also required; both must exit 1 when absent.
 - **Exactly two tools:** `ntfy_publish` and `ntfy_read`. Do not add a third.
 - **One event type:** `ntfy.message`, delivery `["push","poll"]`.
-- **SEP-3415 revision is `2026-07-28`.** No `initialize` handshake, no stdio,
-  no pre-2026 compatibility layer. Successful results carry
-  `resultType: "complete"`.
+- **SEP-3415 revision is `2026-07-28`.** `server/discover`, per-request
+  `_meta` capabilities and the events extension are the native protocol. On the
+  operator's decision the server **also** answers the legacy `2025-11-25`
+  `initialize` handshake as a compatibility path, so clients built on the
+  released MCP revision (the pi client) can attach; the client's top-level
+  `params.protocolVersion` is echoed back for `2025-11-25`, `2025-06-18`,
+  `2025-03-26` and `2024-11-05`, and any other version is answered with
+  `2026-07-28`. stdio and pre-2025 revisions stay out of scope. Successful
+  results carry `resultType: "complete"`.
 - **From-now semantics:** absent and `null` cursors mean "start now". Never
   deliver cached history for a fresh subscription. The first `active` frame
   carries a `t<unix>` watermark.

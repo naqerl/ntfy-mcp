@@ -26,9 +26,10 @@ that opened the subscription. The extension targets protocol revision
 - the `extensions` member of server capabilities,
 - `resultType: "complete"` on extension results.
 
-This server implements only that revision. `initialize` and
-`notifications/initialized` are not a compatibility layer; pre-2026 revisions
-and stdio transport are out of scope.
+This server speaks that revision natively. It **also** answers the classic
+`2025-11-25` `initialize` handshake as a compatibility path so clients built on
+released MCP revisions can attach; see [Compatibility](#compatibility). stdio
+transport and pre-2025 revisions are out of scope.
 
 ## Quick start
 
@@ -108,7 +109,45 @@ Topics remain implicit: ntfy exposes no topic-enumeration API (`/v1/topics` is
 Capability negotiation is per request. An explicitly older `_meta.protocolVersion`
 is rejected with `-32026`, and an explicit client capability set that omits the
 events extension is rejected for `events/*`. Omitting `_meta` (as curl recipes
-and the smoke script do) is accepted.
+and the smoke script do) is accepted. The legacy `initialize` handshake is
+exempt from the revision floor: its version lives at the top level of `params`
+and is negotiated there.
+
+## Compatibility
+
+The server accepts two handshakes on the same endpoint.
+
+**Native 2026-07-28.** Clients call `server/discover` (or any method) directly,
+optionally sending per-request capabilities in
+`_meta["io.modelcontextprotocol/clientCapabilities"]`. No session handshake is
+required beyond the `Mcp-Session-Id` transport header.
+
+**Legacy `2025-11-25` `initialize`.** Clients that always start with the
+released handshake send:
+
+```json
+{"jsonrpc":"2.0","id":1,"method":"initialize","params":{
+  "protocolVersion":"2025-11-25","capabilities":{},
+  "clientInfo":{"name":"client","version":"1.0"}}}
+```
+
+and receive the same `capabilities` and `serverInfo` objects `server/discover`
+returns:
+
+```json
+{"protocolVersion":"2025-11-25",
+ "capabilities":{"tools":{"listChanged":false},
+                 "extensions":{"io.modelcontextprotocol/events":{"listChanged":false}}},
+ "serverInfo":{"name":"ntfy-mcp","version":"v0.1.1"},
+ "resultType":"complete"}
+```
+
+The negotiated version rule is simple: echo the client's `protocolVersion` when
+it is one of `2025-11-25`, `2025-06-18`, `2025-03-26` or `2024-11-05`;
+otherwise answer `2026-07-28`. The follow-up `notifications/initialized` is
+accepted silently (HTTP 202, no body). After either handshake, `tools/list` and
+`tools/call` behave identically — legacy clients send no `_meta`, which the
+implementation treats as an empty capability envelope.
 
 ### Sessions and transport
 

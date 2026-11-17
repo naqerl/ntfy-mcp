@@ -76,6 +76,131 @@ func defaultTools() *fakeTools {
 	}
 }
 
+func TestInitializeNegotiatesLegacyRevisions(t *testing.T) {
+	srv := NewServer("v9", defaultTools(), &fakeEvents{})
+	tests := []struct {
+		name    string
+		params  string
+		version string
+	}{
+		{"latest legacy", `{"protocolVersion":"2025-11-25","capabilities":{},"clientInfo":{"name":"pi","version":"1"}}`, "2025-11-25"},
+		{"legacy", `{"protocolVersion":"2025-06-18","capabilities":{},"clientInfo":{"name":"pi","version":"1"}}`, "2025-06-18"},
+		{"older legacy", `{"protocolVersion":"2025-03-26"}`, "2025-03-26"},
+		{"oldest legacy", `{"protocolVersion":"2024-11-05"}`, "2024-11-05"},
+		{"unknown revision", `{"protocolVersion":"2024-01-01"}`, ProtocolRevision},
+		{"future revision", `{"protocolVersion":"2027-01-01"}`, ProtocolRevision},
+		{"absent params", ``, ProtocolRevision},
+		{"absent version", `{"capabilities":{}}`, ProtocolRevision},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			resp, rpcErr := srv.Handle(context.Background(), Request{
+				Method: "initialize",
+				Params: json.RawMessage(tt.params),
+			}, &fakeResponder{})
+			if rpcErr != nil {
+				t.Fatalf("Handle: %v", rpcErr)
+			}
+			m := resp.(map[string]any)
+			if m["resultType"] != "complete" {
+				t.Fatalf("resultType = %v", m["resultType"])
+			}
+			if m["protocolVersion"] != tt.version {
+				t.Fatalf("protocolVersion = %v, want %s", m["protocolVersion"], tt.version)
+			}
+			info, ok := m["serverInfo"].(map[string]any)
+			if !ok || info["name"] != "ntfy-mcp" || info["version"] != "v9" {
+				t.Fatalf("serverInfo = %+v", m["serverInfo"])
+			}
+			caps, ok := m["capabilities"].(map[string]any)
+			if !ok {
+				t.Fatalf("capabilities = %+v", m["capabilities"])
+			}
+			tools, ok := caps["tools"].(map[string]any)
+			if !ok || tools["listChanged"] != false {
+				t.Fatalf("tools capability = %+v", caps["tools"])
+			}
+		})
+	}
+}
+
+func TestInitializeOmitsVersionDefaultsToDev(t *testing.T) {
+	srv := NewServer("", defaultTools(), nil)
+	resp, rpcErr := srv.Handle(context.Background(), Request{Method: "initialize"}, &fakeResponder{})
+	if rpcErr != nil {
+		t.Fatalf("Handle: %v", rpcErr)
+	}
+	info := resp.(map[string]any)["serverInfo"].(map[string]any)
+	if info["version"] != "dev" {
+		t.Fatalf("serverInfo = %+v", info)
+	}
+}
+
+func TestInitializeRejectsMalformedParams(t *testing.T) {
+	srv := NewServer("test", defaultTools(), nil)
+	_, rpcErr := srv.Handle(context.Background(), Request{
+		Method: "initialize",
+		Params: json.RawMessage(`{"protocolVersion":1}`),
+	}, &fakeResponder{})
+	if rpcErr == nil || rpcErr.Code != CodeInvalidParams {
+		t.Fatalf("error = %v", rpcErr)
+	}
+}
+
+func TestInitializeThenLegacyToolCalls(t *testing.T) {
+	tools := defaultTools()
+	srv := NewServer("test", tools, &fakeEvents{})
+	_, rpcErr := srv.Handle(context.Background(), Request{
+		Method: "initialize",
+		Params: json.RawMessage(`{"protocolVersion":"2025-11-25","capabilities":{},"clientInfo":{"name":"pi","version":"1"}}`),
+	}, &fakeResponder{})
+	if rpcErr != nil {
+		t.Fatalf("initialize: %v", rpcErr)
+	}
+
+	// A legacy client sends no _meta; tools must list and call unchanged.
+	resp, rpcErr := srv.Handle(context.Background(), Request{Method: "tools/list"}, &fakeResponder{})
+	if rpcErr != nil {
+		t.Fatalf("tools/list: %v", rpcErr)
+	}
+	listed := resp.(map[string]any)["tools"].([]Tool)
+	names := make(map[string]bool, len(listed))
+	for _, tool := range listed {
+		names[tool.Name] = true
+	}
+	if len(listed) != 2 || !names["ntfy_publish"] || !names["ntfy_read"] {
+		t.Fatalf("tools = %+v", listed)
+	}
+
+	resp, rpcErr = srv.Handle(context.Background(), Request{
+		Method: "tools/call",
+		Params: json.RawMessage(`{"name":"ntfy_read","arguments":{"topic":"t"}}`),
+	}, &fakeResponder{})
+	if rpcErr != nil {
+		t.Fatalf("tools/call: %v", rpcErr)
+	}
+	call := resp.(map[string]any)
+	if call["resultType"] != "complete" || call["isError"] != false {
+		t.Fatalf("tools/call = %+v", call)
+	}
+	if tools.lastName != "ntfy_read" {
+		t.Fatalf("tool call = %q", tools.lastName)
+	}
+}
+
+func TestNotificationsInitializedIsSilent(t *testing.T) {
+	srv := NewServer("test", defaultTools(), nil)
+	resp, rpcErr := srv.Handle(context.Background(), Request{
+		Method: "notifications/initialized",
+	}, &fakeResponder{})
+	if rpcErr != nil {
+		t.Fatalf("error = %v", rpcErr)
+	}
+	if resp != nil {
+		t.Fatalf("result = %+v, want nil", resp)
+	}
+}
+
 func TestDiscoverAdvertisesEventsExtension(t *testing.T) {
 	srv := NewServer("v9", defaultTools(), &fakeEvents{})
 	result, rpcErr := srv.Handle(context.Background(), Request{Method: "server/discover"}, &fakeResponder{})
@@ -265,7 +390,7 @@ func TestEventsStreamErrorBeforeEmit(t *testing.T) {
 func TestAbsentMethods(t *testing.T) {
 	srv := NewServer("test", nil, nil)
 	for _, method := range []string{
-		"initialise", "initialize", "events/subscribe", "events/unsubscribe", "subscriptions/listen", "nope",
+		"initialise", "events/subscribe", "events/unsubscribe", "subscriptions/listen", "nope",
 	} {
 		_, rpcErr := srv.Handle(context.Background(), Request{Method: method}, &fakeResponder{})
 		if rpcErr == nil || rpcErr.Code != CodeMethodNotFound {

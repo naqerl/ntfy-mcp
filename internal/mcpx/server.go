@@ -55,6 +55,18 @@ func NewServer(version string, tools ToolProvider, events EventProvider) *Server
 	return &Server{Version: version, Tools: tools, Events: events}
 }
 
+// legacyRevisions are the initialize-handshake revisions served as a
+// compatibility path on top of the native 2026-07-28 protocol. A client that
+// asks for one of these revisions in the top-level params.protocolVersion gets
+// its own version echoed back. Anything else, including versions newer than
+// ProtocolRevision, is answered with ProtocolRevision.
+var legacyRevisions = map[string]bool{
+	"2025-11-25": true,
+	"2025-06-18": true,
+	"2025-03-26": true,
+	"2024-11-05": true,
+}
+
 // Handle dispatches one request. For events/stream it blocks until the stream
 // ends or ctx is cancelled and returns (nil, nil); all notifications have been
 // written through r.
@@ -63,6 +75,14 @@ func (s *Server) Handle(ctx context.Context, req Request, r Responder) (any, *Er
 		return nil, err
 	}
 	switch req.Method {
+	case "initialize":
+		return s.initializeResult(req.Params)
+
+	case "notifications/initialized":
+		// The legacy handshake's follow-up notification carries no request and
+		// no result. The transport never writes a body for notifications.
+		return nil, nil
+
 	case "server/discover":
 		return complete(s.discoverResult()), nil
 
@@ -133,7 +153,9 @@ func (s *Server) Handle(ctx context.Context, req Request, r Responder) (any, *Er
 // negotiate applies the per-request capability envelope described by the
 // 2026 protocol. Clients that omit _meta are still served (the smoke script and
 // curl examples rely on that), but an explicitly older revision or an explicit
-// capability set without the events extension is rejected.
+// capability set without the events extension is rejected. The legacy
+// initialize handshake is exempt from the revision floor: its version is
+// negotiated in initializeResult, not here.
 func (s *Server) negotiate(req Request) *Error {
 	trimmed := bytes.TrimSpace(req.Params)
 	if len(trimmed) == 0 || trimmed[0] != '{' {
@@ -148,7 +170,11 @@ func (s *Server) negotiate(req Request) *Error {
 	if err := json.Unmarshal(trimmed, &params); err != nil {
 		return nil
 	}
-	if v := params.Meta.ProtocolVersion; v != "" && v < ProtocolRevision {
+	// The 2026 methods keep the revision floor. initialize is the compatibility
+	// path: a legacy client puts its version at the top level of params and
+	// sends no _meta, and initializeResult negotiates that version down, so an
+	// explicit older _meta value must not reject the handshake itself.
+	if v := params.Meta.ProtocolVersion; v != "" && v < ProtocolRevision && req.Method != "initialize" {
 		return NewError(CodeUnsupported,
 			"protocol revision is older than "+ProtocolRevision,
 			map[string]any{"feature": "protocolVersion", "value": v})
@@ -192,27 +218,59 @@ func isExtensionMethod(method string) bool {
 	return method == "events/list" || method == "events/poll" || method == "events/stream"
 }
 
-func (s *Server) discoverResult() map[string]any {
+// initializeResult answers the legacy 2025-11-25 initialize handshake. The
+// negotiated version is the client's own when it is one this server serves as a
+// compatibility path, otherwise ProtocolRevision. The capabilities and
+// serverInfo members are exactly the ones server/discover advertises.
+func (s *Server) initializeResult(raw json.RawMessage) (any, *Error) {
+	var params struct {
+		ProtocolVersion string `json:"protocolVersion"`
+	}
+	if trimmed := bytes.TrimSpace(raw); len(trimmed) > 0 {
+		if err := json.Unmarshal(trimmed, &params); err != nil {
+			return nil, NewError(CodeInvalidParams, "invalid params: "+err.Error(), nil)
+		}
+	}
+	version := ProtocolRevision
+	if legacyRevisions[params.ProtocolVersion] {
+		version = params.ProtocolVersion
+	}
+	return complete(map[string]any{
+		"protocolVersion": version,
+		"capabilities":    s.capabilities(),
+		"serverInfo":      s.serverInfo(),
+	}), nil
+}
+
+func (s *Server) serverInfo() map[string]any {
 	version := s.Version
 	if version == "" {
 		version = "dev"
 	}
 	return map[string]any{
-		"protocolVersion": ProtocolRevision,
-		"serverInfo": map[string]any{
-			"name":    "ntfy-mcp",
-			"version": version,
+		"name":    "ntfy-mcp",
+		"version": version,
+	}
+}
+
+func (s *Server) capabilities() map[string]any {
+	return map[string]any{
+		"tools": map[string]any{
+			"listChanged": false,
 		},
-		"capabilities": map[string]any{
-			"tools": map[string]any{
+		"extensions": map[string]any{
+			EventsExtension: map[string]any{
 				"listChanged": false,
 			},
-			"extensions": map[string]any{
-				EventsExtension: map[string]any{
-					"listChanged": false,
-				},
-			},
 		},
+	}
+}
+
+func (s *Server) discoverResult() map[string]any {
+	return map[string]any{
+		"protocolVersion": ProtocolRevision,
+		"serverInfo":      s.serverInfo(),
+		"capabilities":    s.capabilities(),
 	}
 }
 

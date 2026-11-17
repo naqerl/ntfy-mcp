@@ -22,9 +22,10 @@ const (
 	CodeUnsupported       = -32026
 )
 
-// ProtocolRevision is the SEP-3415 revision this server targets. Only the
-// 2026-07-28 protocol shape (per-request capabilities, server/discover, and
-// capability extensions) is implemented.
+// ProtocolRevision is the SEP-3415 revision this server targets. The 2026-07-28
+// protocol shape (per-request capabilities, server/discover, and capability
+// extensions) is the native protocol; the 2025-11-25 initialize handshake is
+// additionally served as a compatibility path.
 const ProtocolRevision = "2026-07-28"
 
 // EventsExtension is the SEP-3415 extension identifier.

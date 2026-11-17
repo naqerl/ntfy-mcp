@@ -188,6 +188,71 @@ func TestNotificationsOnlyAccepted(t *testing.T) {
 	}
 }
 
+func TestLegacyInitializeHandshakeOverHTTP(t *testing.T) {
+	h := testHandler(nil)
+
+	init := doRequest(h, http.MethodPost,
+		`{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-11-25","capabilities":{},"clientInfo":{"name":"pi","version":"1"}}}`,
+		"", "application/json", "secret")
+	if init.Code != http.StatusOK {
+		t.Fatalf("initialize status = %d body=%s", init.Code, init.Body.String())
+	}
+	session := init.Header().Get(SessionHeader)
+	if session == "" {
+		t.Fatal("missing session header")
+	}
+	var initResp Response
+	if err := json.Unmarshal(init.Body.Bytes(), &initResp); err != nil {
+		t.Fatalf("decode initialize: %v", err)
+	}
+	if initResp.Error != nil {
+		t.Fatalf("initialize error = %v", initResp.Error)
+	}
+	result := initResp.Result.(map[string]any)
+	if result["protocolVersion"] != "2025-11-25" || result["resultType"] != "complete" {
+		t.Fatalf("initialize result = %+v", result)
+	}
+
+	// notifications/initialized produces no response body and no JSON-RPC error.
+	notified := doRequest(h, http.MethodPost, `{"jsonrpc":"2.0","method":"notifications/initialized"}`,
+		session, "application/json", "secret")
+	if notified.Code != http.StatusAccepted {
+		t.Fatalf("notifications/initialized status = %d", notified.Code)
+	}
+	if body := strings.TrimSpace(notified.Body.String()); body != "" {
+		t.Fatalf("notifications/initialized body = %q", body)
+	}
+
+	// A legacy client sends no _meta; tools keep working on the same session.
+	list := doRequest(h, http.MethodPost, `{"jsonrpc":"2.0","id":2,"method":"tools/list"}`,
+		session, "application/json", "secret")
+	var listResp Response
+	if err := json.Unmarshal(list.Body.Bytes(), &listResp); err != nil {
+		t.Fatalf("decode tools/list: %v", err)
+	}
+	if listResp.Error != nil {
+		t.Fatalf("tools/list error = %v", listResp.Error)
+	}
+	tools, ok := listResp.Result.(map[string]any)["tools"].([]any)
+	if !ok || len(tools) != 2 {
+		t.Fatalf("tools = %+v", listResp.Result)
+	}
+
+	call := doRequest(h, http.MethodPost,
+		`{"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"ntfy_read","arguments":{"topic":"t"}}}`,
+		session, "application/json", "secret")
+	var callResp Response
+	if err := json.Unmarshal(call.Body.Bytes(), &callResp); err != nil {
+		t.Fatalf("decode tools/call: %v", err)
+	}
+	if callResp.Error != nil {
+		t.Fatalf("tools/call error = %v", callResp.Error)
+	}
+	if callResp.Result.(map[string]any)["resultType"] != "complete" {
+		t.Fatalf("tools/call result = %+v", callResp.Result)
+	}
+}
+
 func TestToolsCallOverHTTP(t *testing.T) {
 	h := testHandler(nil)
 	rr := doRequest(h, http.MethodPost,
