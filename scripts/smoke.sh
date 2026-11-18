@@ -161,7 +161,7 @@ echo "smoke: fresh events/stream emits active and no cached history"
 # Make the cached message unambiguously older than the subscription watermark.
 sleep 1.1
 stream_payload="$(jq -nc --arg t "$TOPIC" \
-  '{jsonrpc:"2.0",id:7,method:"events/stream",params:{event:"ntfy.message",filter:{topic:$t},_meta:{subscriptionId:"smoke-sub"}}}')"
+  '{jsonrpc:"2.0",id:7,method:"events/stream",params:{event:"ntfy.message",filter:{topic:$t}}}')"
 : >"$FRAMES"
 curl -sS -N -X POST "$MCP_URL" \
   -H "Authorization: Bearer $MCP_AUTH_TOKEN" \
@@ -172,8 +172,8 @@ curl -sS -N -X POST "$MCP_URL" \
 STREAM_PID=$!
 
 wait_for 'notifications/events/active' 10 || fail "no active notification"
-grep -q '"io.modelcontextprotocol/subscriptionId":"smoke-sub"' "$FRAMES" ||
-  fail "active frame is missing the SEP-3415 subscription demux key"
+grep -q '"io.modelcontextprotocol/subscriptionId":"7"' "$FRAMES" ||
+  fail "active frame is missing the SEP-3415 request-id subscription key"
 sleep 0.3
 if grep -q -- "$CACHED" "$FRAMES"; then
   fail "cached message was replayed to a from-now subscription"
@@ -216,6 +216,8 @@ wait_for_file "$SUB_FRAMES" '"subscriptionId":"smoke-subscribe"' 10 ||
   fail "no subscribe result with the echoed id"
 wait_for_file "$SUB_FRAMES" 'notifications/events/active' 10 ||
   fail "no active notification for events/subscribe"
+wait_for_file "$SUB_FRAMES" '"io.modelcontextprotocol/subscriptionId":"smoke-subscribe"' 10 ||
+  fail "subscribe frames are missing the SEP-3415 subscription key"
 
 sub_after_payload="$(jq -nc --arg t "$TOPIC" --arg m "$SUB_AFTER" \
   '{jsonrpc:"2.0",id:11,method:"tools/call",params:{name:"ntfy_publish",arguments:{topic:$t,message:$m}}}')"
