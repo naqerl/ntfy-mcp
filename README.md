@@ -106,12 +106,15 @@ Topics remain implicit: ntfy exposes no topic-enumeration API (`/v1/topics` is
 }
 ```
 
-Capability negotiation is per request. An explicitly older `_meta.protocolVersion`
-is rejected with `-32026`, and an explicit client capability set that omits the
-events extension is rejected for `events/*`. Omitting `_meta` (as curl recipes
-and the smoke script do) is accepted. The legacy `initialize` handshake is
-exempt from the revision floor: its version lives at the top level of `params`
-and is negotiated there.
+Capability negotiation is per request. A `_meta.protocolVersion` at or below
+`2026-07-28` is served in that client's mode: a legacy revision such as
+`2025-11-25` is accepted (released clients stamp every request, extension
+streams included, with their negotiated revision), and only a revision newer
+than the server knows is rejected with `-32026`. On the native `2026-07-28`
+revision an explicit client capability set that omits the events extension is
+rejected for `events/*`; legacy clients skip that per-request gate. Omitting
+`_meta` (as curl recipes and the smoke script do) is accepted. The legacy
+`initialize` handshake keeps its top-level version negotiation.
 
 ## Compatibility
 

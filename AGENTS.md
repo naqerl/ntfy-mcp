@@ -23,7 +23,10 @@ not expose. Do not reintroduce the SDK just for transport convenience.
   `params.protocolVersion` is echoed back for `2025-11-25`, `2025-06-18`,
   `2025-03-26` and `2024-11-05`, and any other version is answered with
   `2026-07-28`. stdio and pre-2025 revisions stay out of scope. Successful
-  results carry `resultType: "complete"`.
+  results carry `resultType: "complete"`. A `_meta.protocolVersion` at or
+  below `2026-07-28` is served in legacy mode (only a newer/unknown future
+  revision is `-32026`); the per-request capability gate applies only to the
+  native `2026-07-28` revision.
 - **From-now semantics:** absent and `null` cursors mean "start now". Never
   deliver cached history for a fresh subscription. The first `active` frame
   carries a `t<unix>` watermark.

@@ -190,10 +190,13 @@ func (s *Server) Handle(ctx context.Context, req Request, r Responder) (any, *Er
 
 // negotiate applies the per-request capability envelope described by the
 // 2026 protocol. Clients that omit _meta are still served (the smoke script and
-// curl examples rely on that), but an explicitly older revision or an explicit
-// capability set without the events extension is rejected. The legacy
-// initialize handshake is exempt from the revision floor: its version is
-// negotiated in initializeResult, not here.
+// curl examples rely on that). A legacy revision in _meta is served in legacy
+// mode rather than rejected: released clients, including pi's adapter, stamp
+// every request — streams included — with the negotiated 2025-11-25 revision.
+// Only a revision newer than ProtocolRevision is refused. The explicit
+// capability gate stays on the native revision; a legacy client never
+// negotiated the extension per request. The legacy initialize handshake is
+// exempt too: its version is negotiated in initializeResult, not here.
 func (s *Server) negotiate(req Request) *Error {
 	trimmed := bytes.TrimSpace(req.Params)
 	if len(trimmed) == 0 || trimmed[0] != '{' {
@@ -208,14 +211,21 @@ func (s *Server) negotiate(req Request) *Error {
 	if err := json.Unmarshal(trimmed, &params); err != nil {
 		return nil
 	}
-	// The 2026 methods keep the revision floor. initialize is the compatibility
-	// path: a legacy client puts its version at the top level of params and
-	// sends no _meta, and initializeResult negotiates that version down, so an
-	// explicit older _meta value must not reject the handshake itself.
-	if v := params.Meta.ProtocolVersion; v != "" && v < ProtocolRevision && req.Method != "initialize" {
-		return NewError(CodeUnsupported,
-			"protocol revision is older than "+ProtocolRevision,
-			map[string]any{"feature": "protocolVersion", "value": v})
+	// Serve every revision at or below the native one. A client that sends its
+	// negotiated legacy revision must not be refused: its extension stream would
+	// end before the first frame. initialize is exempt because it negotiates the
+	// version itself, and the capability gate below only applies to
+	// 2026-07-28.
+	version := params.Meta.ProtocolVersion
+	if version != "" && req.Method != "initialize" {
+		if version > ProtocolRevision {
+			return NewError(CodeUnsupported,
+				"protocol revision is newer than "+ProtocolRevision,
+				map[string]any{"feature": "protocolVersion", "value": version})
+		}
+		if version != ProtocolRevision {
+			return nil
+		}
 	}
 	capabilities := bytes.TrimSpace(params.Meta.ClientCapabilities)
 	if len(capabilities) == 0 || !isExtensionMethod(req.Method) {

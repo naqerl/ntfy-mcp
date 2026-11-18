@@ -8,6 +8,14 @@ All notable changes to this project are documented here. The format follows
 
 ### Fixed
 
+- A legacy `_meta.protocolVersion` (for example `2025-11-25`) is no longer
+  rejected with `-32026` on the native methods. Released clients stamp every
+  request, extension streams included, with the revision they negotiated, so
+  the refusal closed `events/stream` before its first frame and produced
+  `Event stream activation timed out`. Any revision at or below `2026-07-28`
+  is served in legacy mode; only a revision newer than the server knows is
+  refused. The per-request capability gate still applies to native
+  `2026-07-28` requests.
 - Stream notifications now carry the SEP-3415 demux key
   `_meta["io.modelcontextprotocol/subscriptionId"]`, set to the JSON-RPC id of
   the request that opened the stream. Clients route push frames by that key

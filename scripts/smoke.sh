@@ -17,8 +17,10 @@ SESSION=""
 SESSION_FILE="$(mktemp)"
 FRAMES="$(mktemp)"
 SUB_FRAMES="$(mktemp)"
+LEGACY_FRAMES="$(mktemp)"
 STREAM_PID=""
 SUB_PID=""
+LEGACY_PID=""
 cleanup() {
   if [[ -n "$STREAM_PID" ]]; then
     kill "$STREAM_PID" 2>/dev/null || true
@@ -28,7 +30,11 @@ cleanup() {
     kill "$SUB_PID" 2>/dev/null || true
     wait "$SUB_PID" 2>/dev/null || true
   fi
-  rm -f "$FRAMES" "$SUB_FRAMES" "$SESSION_FILE"
+  if [[ -n "$LEGACY_PID" ]]; then
+    kill "$LEGACY_PID" 2>/dev/null || true
+    wait "$LEGACY_PID" 2>/dev/null || true
+  fi
+  rm -f "$FRAMES" "$SUB_FRAMES" "$LEGACY_FRAMES" "$SESSION_FILE"
 }
 trap cleanup EXIT
 
@@ -245,6 +251,26 @@ fi
 wait "$SUB_PID" 2>/dev/null || true
 SUB_PID=""
 grep -q 'notifications/events/event' "$SUB_FRAMES" || fail "subscription event frame disappeared"
+
+echo "smoke: legacy _meta.protocolVersion still opens a stream"
+legacy_payload="$(jq -nc --arg t "$TOPIC" \
+  '{jsonrpc:"2.0",id:13,method:"events/stream",params:{event:"ntfy.message",filter:{topic:$t},_meta:{protocolVersion:"2025-11-25"}}}')"
+: >"$LEGACY_FRAMES"
+curl -sS -N -X POST "$MCP_URL" \
+  -H "Authorization: Bearer $MCP_AUTH_TOKEN" \
+  -H "Content-Type: application/json" \
+  -H "Accept: text/event-stream" \
+  -H "Mcp-Session-Id: $SESSION" \
+  --data-binary "$legacy_payload" >"$LEGACY_FRAMES" 2>/dev/null &
+LEGACY_PID=$!
+wait_for_file "$LEGACY_FRAMES" 'notifications/events/active' 10 ||
+  fail "legacy _meta.protocolVersion stream did not activate"
+if grep -q '"code":-32026' "$LEGACY_FRAMES"; then
+  fail "legacy _meta.protocolVersion was rejected with -32026"
+fi
+kill "$LEGACY_PID" 2>/dev/null || true
+wait "$LEGACY_PID" 2>/dev/null || true
+LEGACY_PID=""
 
 if [[ -n "$MCP_IMAGE" ]]; then
   command -v docker >/dev/null || fail "MCP_IMAGE set but docker is unavailable"
