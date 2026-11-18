@@ -28,15 +28,17 @@ type EventDescriptor struct {
 	PayloadSchema map[string]any `json:"payloadSchema"`
 }
 
-// EventProvider supplies the SEP-3415 events extension.
+// EventProvider supplies the SEP-3415 events extension. subscriptionID is the
+// caller's default subscription id (the JSON-RPC request id for a stream) and
+// is used when the request params do not carry one of their own.
 type EventProvider interface {
 	ListEvents() []EventDescriptor
 	PollEvents(ctx context.Context, params json.RawMessage) (any, error)
-	StreamEvents(ctx context.Context, params json.RawMessage, emit func(Notification) error) error
+	StreamEvents(ctx context.Context, params json.RawMessage, subscriptionID string, emit func(Notification) error) error
 	// SubscribeEvents registers a push subscription, calls respond with the
 	// subscription result before the first event frame, and blocks until the
 	// subscription ends. Events are pushed through emit.
-	SubscribeEvents(ctx context.Context, params json.RawMessage, respond func(result any) error, emit func(Notification) error) error
+	SubscribeEvents(ctx context.Context, params json.RawMessage, subscriptionID string, respond func(result any) error, emit func(Notification) error) error
 	// UnsubscribeEvents cancels a subscription by id or by event selector.
 	UnsubscribeEvents(ctx context.Context, params json.RawMessage) (any, error)
 }
@@ -143,7 +145,7 @@ func (s *Server) Handle(ctx context.Context, req Request, r Responder) (any, *Er
 					"value":   "Accept",
 				})
 		}
-		if err := s.Events.StreamEvents(ctx, req.Params, r.Send); err != nil {
+		if err := s.Events.StreamEvents(ctx, req.Params, requestSubscriptionID(req), r.Send); err != nil {
 			return nil, asRPCError(err)
 		}
 		return nil, nil
@@ -162,7 +164,7 @@ func (s *Server) Handle(ctx context.Context, req Request, r Responder) (any, *Er
 		respond := func(result any) error {
 			return r.Respond(SuccessResponse(req.ID, completeMap(result)))
 		}
-		if err := s.Events.SubscribeEvents(ctx, req.Params, respond, r.Send); err != nil {
+		if err := s.Events.SubscribeEvents(ctx, req.Params, requestSubscriptionID(req), respond, r.Send); err != nil {
 			return nil, asRPCError(err)
 		}
 		return nil, nil
@@ -188,10 +190,13 @@ func (s *Server) Handle(ctx context.Context, req Request, r Responder) (any, *Er
 
 // negotiate applies the per-request capability envelope described by the
 // 2026 protocol. Clients that omit _meta are still served (the smoke script and
-// curl examples rely on that), but an explicitly older revision or an explicit
-// capability set without the events extension is rejected. The legacy
-// initialize handshake is exempt from the revision floor: its version is
-// negotiated in initializeResult, not here.
+// curl examples rely on that). A legacy revision in _meta is served in legacy
+// mode rather than rejected: released clients, including pi's adapter, stamp
+// every request — streams included — with the negotiated 2025-11-25 revision.
+// Only a revision newer than ProtocolRevision is refused. The explicit
+// capability gate stays on the native revision; a legacy client never
+// negotiated the extension per request. The legacy initialize handshake is
+// exempt too: its version is negotiated in initializeResult, not here.
 func (s *Server) negotiate(req Request) *Error {
 	trimmed := bytes.TrimSpace(req.Params)
 	if len(trimmed) == 0 || trimmed[0] != '{' {
@@ -206,14 +211,21 @@ func (s *Server) negotiate(req Request) *Error {
 	if err := json.Unmarshal(trimmed, &params); err != nil {
 		return nil
 	}
-	// The 2026 methods keep the revision floor. initialize is the compatibility
-	// path: a legacy client puts its version at the top level of params and
-	// sends no _meta, and initializeResult negotiates that version down, so an
-	// explicit older _meta value must not reject the handshake itself.
-	if v := params.Meta.ProtocolVersion; v != "" && v < ProtocolRevision && req.Method != "initialize" {
-		return NewError(CodeUnsupported,
-			"protocol revision is older than "+ProtocolRevision,
-			map[string]any{"feature": "protocolVersion", "value": v})
+	// Serve every revision at or below the native one. A client that sends its
+	// negotiated legacy revision must not be refused: its extension stream would
+	// end before the first frame. initialize is exempt because it negotiates the
+	// version itself, and the capability gate below only applies to
+	// 2026-07-28.
+	version := params.Meta.ProtocolVersion
+	if version != "" && req.Method != "initialize" {
+		if version > ProtocolRevision {
+			return NewError(CodeUnsupported,
+				"protocol revision is newer than "+ProtocolRevision,
+				map[string]any{"feature": "protocolVersion", "value": version})
+		}
+		if version != ProtocolRevision {
+			return nil
+		}
 	}
 	capabilities := bytes.TrimSpace(params.Meta.ClientCapabilities)
 	if len(capabilities) == 0 || !isExtensionMethod(req.Method) {
@@ -358,6 +370,23 @@ func decodeParams(raw json.RawMessage, dst any) *Error {
 
 func methodNotFound(method string) *Error {
 	return NewError(CodeMethodNotFound, fmt.Sprintf("method %q not found", method), nil)
+}
+
+// requestSubscriptionID is the default subscription id for a streaming
+// request. SEP-3415 demultiplexes notifications on
+// _meta["io.modelcontextprotocol/subscriptionId"], whose value is the stream
+// request's JSON-RPC id verbatim. Using that id when the client does not send a
+// subscriptionId keeps the stream addressable by the client that opened it.
+func requestSubscriptionID(req Request) string {
+	trimmed := bytes.TrimSpace(req.ID)
+	if len(trimmed) == 0 || bytes.Equal(trimmed, []byte("null")) {
+		return ""
+	}
+	var s string
+	if err := json.Unmarshal(trimmed, &s); err == nil {
+		return s
+	}
+	return string(trimmed)
 }
 
 func complete(result map[string]any) map[string]any {

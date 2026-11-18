@@ -23,12 +23,20 @@ not expose. Do not reintroduce the SDK just for transport convenience.
   `params.protocolVersion` is echoed back for `2025-11-25`, `2025-06-18`,
   `2025-03-26` and `2024-11-05`, and any other version is answered with
   `2026-07-28`. stdio and pre-2025 revisions stay out of scope. Successful
-  results carry `resultType: "complete"`.
+  results carry `resultType: "complete"`. A `_meta.protocolVersion` at or
+  below `2026-07-28` is served in legacy mode (only a newer/unknown future
+  revision is `-32026`); the per-request capability gate applies only to the
+  native `2026-07-28` revision.
 - **From-now semantics:** absent and `null` cursors mean "start now". Never
   deliver cached history for a fresh subscription. The first `active` frame
   carries a `t<unix>` watermark.
 - **Opaque cursor:** `t<unix>` before the first message, ntfy message id
   afterwards. `eventId` is the ntfy message id so poll/push dedupe works.
+- **Subscription demux:** every notification carries
+  `_meta["io.modelcontextprotocol/subscriptionId"]` equal to the JSON-RPC id
+  of the request that opened the stream (a client-supplied `subscriptionId`
+  wins). Event frames expose `name`, `timestamp` and `data`; the older
+  `event`/`payload` fields stay as aliases.
 - **Heartbeat ≤ 30s** (default 25s). Flush after every SSE frame using
   `http.NewResponseController(w).Flush()`.
 - **Reserved topics** (`docs`, `static`, `file`, `app`, `metrics`, `account`,

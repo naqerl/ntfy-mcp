@@ -4,6 +4,32 @@ All notable changes to this project are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and this project uses
 [semantic versioning](https://semver.org/).
 
+## [0.1.4] - 2026-11-18
+
+### Fixed
+
+- A legacy `_meta.protocolVersion` (for example `2025-11-25`) is no longer
+  rejected with `-32026` on the native methods. Released clients stamp every
+  request, extension streams included, with the revision they negotiated, so
+  the refusal closed `events/stream` before its first frame and produced
+  `Event stream activation timed out`. Any revision at or below `2026-07-28`
+  is served in legacy mode; only a revision newer than the server knows is
+  refused. The per-request capability gate still applies to native
+  `2026-07-28` requests.
+- Stream notifications now carry the SEP-3415 demux key
+  `_meta["io.modelcontextprotocol/subscriptionId"]`, set to the JSON-RPC id of
+  the request that opened the stream. Clients route push frames by that key
+  (`pi-mcp-events` on top of `pi-mcp-adapter` looks up its stream entry with
+  it), so `events/stream` and `events/subscribe` no longer time out during
+  activation. A client-supplied `subscriptionId` still wins; otherwise the
+  request id is the subscription id.
+- `notifications/events/event` frames now expose the SEP-3415 payload fields
+  `name`, `timestamp` and `data` alongside the existing `event`, `eventId`,
+  `cursor` and `payload` fields, so consumers that validate the draft shape
+  accept the event instead of dropping it.
+- `events/subscribe` results carry the same
+  `_meta["io.modelcontextprotocol/subscriptionId"]` stamp.
+
 ## [0.1.3] - 2026-11-18
 
 ### Added

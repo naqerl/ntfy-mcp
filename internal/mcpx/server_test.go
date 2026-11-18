@@ -43,6 +43,9 @@ type fakeEvents struct {
 	streamCalls      int
 	subscribeCalls   int
 	unsubscribeCalls int
+
+	streamSubscriptionID    string
+	subscribeSubscriptionID string
 }
 
 func (f *fakeEvents) ListEvents() []EventDescriptor { return f.defs }
@@ -52,16 +55,18 @@ func (f *fakeEvents) PollEvents(_ context.Context, _ json.RawMessage) (any, erro
 	return f.pollResult, f.pollErr
 }
 
-func (f *fakeEvents) StreamEvents(ctx context.Context, raw json.RawMessage, emit func(Notification) error) error {
+func (f *fakeEvents) StreamEvents(ctx context.Context, raw json.RawMessage, subscriptionID string, emit func(Notification) error) error {
 	f.streamCalls++
+	f.streamSubscriptionID = subscriptionID
 	if f.stream != nil {
 		return f.stream(ctx, raw, emit)
 	}
 	return f.streamErr
 }
 
-func (f *fakeEvents) SubscribeEvents(ctx context.Context, raw json.RawMessage, respond func(any) error, emit func(Notification) error) error {
+func (f *fakeEvents) SubscribeEvents(ctx context.Context, raw json.RawMessage, subscriptionID string, respond func(any) error, emit func(Notification) error) error {
 	f.subscribeCalls++
+	f.subscribeSubscriptionID = subscriptionID
 	if f.subscribe != nil {
 		return f.subscribe(ctx, raw, respond, emit)
 	}
@@ -399,12 +404,15 @@ func TestEventsStreamPushRequiresSSE(t *testing.T) {
 	}
 
 	resp := &fakeResponder{sse: true}
-	_, rpcErr = srv.Handle(context.Background(), Request{Method: "events/stream", Params: json.RawMessage(`{}`)}, resp)
+	_, rpcErr = srv.Handle(context.Background(), Request{ID: json.RawMessage(`42`), Method: "events/stream", Params: json.RawMessage(`{}`)}, resp)
 	if rpcErr != nil {
 		t.Fatalf("stream: %v", rpcErr)
 	}
 	if len(resp.sent) != 1 || resp.sent[0].Method != "notifications/events/active" {
 		t.Fatalf("sent = %+v", resp.sent)
+	}
+	if events.streamSubscriptionID != "42" {
+		t.Fatalf("default subscription id = %q, want the request id", events.streamSubscriptionID)
 	}
 }
 
@@ -452,6 +460,9 @@ func TestEventsSubscribeRepliesThenStreams(t *testing.T) {
 	}
 	if len(resp.sent) != 2 || resp.sent[0].Method != "notifications/events/active" || resp.sent[1].Method != "notifications/events/event" {
 		t.Fatalf("sent = %+v", resp.sent)
+	}
+	if events.subscribeSubscriptionID != "7" {
+		t.Fatalf("default subscription id = %q, want the request id", events.subscribeSubscriptionID)
 	}
 }
 
@@ -565,13 +576,13 @@ func TestCapabilityNegotiation(t *testing.T) {
 		t.Fatalf("null capabilities: %v", rpcErr)
 	}
 
-	// The 2026 revision is the floor.
+	// A revision newer than the server knows is unsupported.
 	_, rpcErr = srv.Handle(context.Background(), Request{
 		Method: "ping",
-		Params: json.RawMessage(`{"_meta":{"protocolVersion":"2025-11-25"}}`),
+		Params: json.RawMessage(`{"_meta":{"protocolVersion":"2027-01-01"}}`),
 	}, &fakeResponder{})
 	if rpcErr == nil || rpcErr.Code != CodeUnsupported {
-		t.Fatalf("old revision: %v", rpcErr)
+		t.Fatalf("future revision: %v", rpcErr)
 	}
 
 	// Malformed capabilities are invalid params.
@@ -581,5 +592,57 @@ func TestCapabilityNegotiation(t *testing.T) {
 	}, &fakeResponder{})
 	if rpcErr == nil || rpcErr.Code != CodeInvalidParams {
 		t.Fatalf("bad caps: %v", rpcErr)
+	}
+}
+
+func TestNegotiateProtocolRevision(t *testing.T) {
+	tests := []struct {
+		name     string
+		params   string
+		wantCode int
+	}{
+		{"absent", `{}`, 0},
+		{"legacy 2025-11-25", `{"_meta":{"protocolVersion":"2025-11-25"}}`, 0},
+		{"legacy 2024-11-05", `{"_meta":{"protocolVersion":"2024-11-05"}}`, 0},
+		{"native 2026-07-28", `{"_meta":{"protocolVersion":"2026-07-28"}}`, 0},
+		{"future 2027-01-01", `{"_meta":{"protocolVersion":"2027-01-01"}}`, CodeUnsupported},
+		{
+			"legacy skips the native capability gate",
+			`{"_meta":{"protocolVersion":"2025-11-25","io.modelcontextprotocol/clientCapabilities":{}}}`,
+			0,
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			events := &fakeEvents{stream: func(_ context.Context, _ json.RawMessage, emit func(Notification) error) error {
+				return emit(NewNotification("notifications/events/active", map[string]any{"cursor": "t1"}))
+			}}
+			srv := NewServer("test", nil, events)
+			resp := &fakeResponder{sse: true}
+			_, rpcErr := srv.Handle(context.Background(), Request{
+				ID:     json.RawMessage(`1`),
+				Method: "events/stream",
+				Params: json.RawMessage(tt.params),
+			}, resp)
+
+			if tt.wantCode != 0 {
+				if rpcErr == nil || rpcErr.Code != tt.wantCode {
+					t.Fatalf("error = %v, want %d", rpcErr, tt.wantCode)
+				}
+				if events.streamCalls != 0 {
+					t.Fatal("provider was called for a rejected revision")
+				}
+				return
+			}
+			if rpcErr != nil {
+				t.Fatalf("stream: %v", rpcErr)
+			}
+			if events.streamCalls != 1 || len(resp.sent) != 1 || resp.sent[0].Method != "notifications/events/active" {
+				t.Fatalf("calls=%d sent=%+v", events.streamCalls, resp.sent)
+			}
+			if events.streamSubscriptionID != "1" {
+				t.Fatalf("default subscription id = %q", events.streamSubscriptionID)
+			}
+		})
 	}
 }
