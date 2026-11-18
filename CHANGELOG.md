@@ -4,6 +4,17 @@ All notable changes to this project are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and this project uses
 [semantic versioning](https://semver.org/).
 
+## [0.1.2] - 2026-11-17
+
+### Fixed
+
+- `events/stream` accepts the SEP-3415 stream envelope
+  `{"name":"<event>","arguments":{…}}` in addition to the flat parameter
+  object: the event name is read from `name` and `arguments` is merged with
+  the inline `cursor`/`maxAgeMs`/`maxEvents`. A client that subscribes by
+  event name (`ntfy.message` + `{"topic":…}`) no longer gets
+  `unknown event ""`.
+
 ## [0.1.1] - 2026-11-17
 
 ### Added

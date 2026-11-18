@@ -267,6 +267,7 @@ func parseParams(raw json.RawMessage) (eventParams, *mcpx.Error) {
 	if len(strings.TrimSpace(string(raw))) == 0 {
 		return p, invalidParams("params are required")
 	}
+	raw = unwrapEventEnvelope(raw)
 	dec := json.NewDecoder(strings.NewReader(string(raw)))
 	if err := dec.Decode(&p); err != nil {
 		return p, invalidParams("invalid params: " + err.Error())
@@ -305,6 +306,58 @@ func parseParams(raw json.RawMessage) (eventParams, *mcpx.Error) {
 	}
 	p.Filter = &filter
 	return p, nil
+}
+
+// unwrapEventEnvelope accepts the `{"name":…,"arguments":{…}}` stream
+// parameters that SEP-3415 clients send, in addition to the flat parameter
+// object this server documents. A flat object is returned untouched, and any
+// argument the envelope carries inline wins over the same key in arguments.
+func unwrapEventEnvelope(raw json.RawMessage) json.RawMessage {
+	var env struct {
+		Name      string                     `json:"name"`
+		Event     string                     `json:"event"`
+		Arguments map[string]json.RawMessage `json:"arguments"`
+	}
+	if err := json.Unmarshal(raw, &env); err != nil {
+		return raw
+	}
+	if env.Event != "" || strings.TrimSpace(env.Name) == "" {
+		return raw
+	}
+
+	merged := make(map[string]json.RawMessage, len(env.Arguments)+5)
+	for key, value := range env.Arguments {
+		merged[key] = value
+	}
+	name, err := json.Marshal(env.Name)
+	if err != nil {
+		return raw
+	}
+	merged["event"] = name
+
+	// cursor, maxAgeMs, maxEvents and subscriptionId live next to name in the
+	// stream request, not inside arguments.
+	var top map[string]json.RawMessage
+	if err := json.Unmarshal(raw, &top); err == nil {
+		for _, key := range []string{"cursor", "maxAgeMs", "maxEvents", "subscriptionId"} {
+			if _, taken := merged[key]; taken {
+				continue
+			}
+			if value, ok := top[key]; ok && len(strings.TrimSpace(string(value))) > 0 {
+				merged[key] = value
+			}
+		}
+	}
+	if env.Arguments == nil {
+		// No arguments object: nothing to merge, keep the original payload so
+		// the caller still sees the real parse error.
+		return raw
+	}
+	out, err := json.Marshal(merged)
+	if err != nil {
+		return raw
+	}
+	return out
 }
 
 // parseCursorParam distinguishes absent/null (from-now) from a cursor string.
