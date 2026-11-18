@@ -144,9 +144,9 @@ func (h *Handler) handleBatch(w http.ResponseWriter, r *http.Request, incoming [
 			responses = append(responses, ErrorResponse(req.ID, inc.Err))
 			continue
 		}
-		if req.Method == "events/stream" {
+		if req.Method == "events/stream" || req.Method == "events/subscribe" {
 			responses = append(responses, ErrorResponse(req.ID,
-				NewError(CodeInvalidRequest, "events/stream cannot be sent in a batch", nil)))
+				NewError(CodeInvalidRequest, req.Method+" cannot be sent in a batch", nil)))
 			continue
 		}
 		if req.IsNotification() {
@@ -182,7 +182,9 @@ func (h *Handler) handleSingle(w http.ResponseWriter, r *http.Request, inc Incom
 		return
 	}
 
-	isStream := req.Method == "events/stream"
+	// events/subscribe also keeps the POST open: it writes its result and then
+	// pushes notifications on the same SSE stream.
+	isStream := req.Method == "events/stream" || req.Method == "events/subscribe"
 	accept := strings.ToLower(r.Header.Get("Accept"))
 	acceptsSSE := accept == "" || strings.Contains(accept, "text/event-stream")
 	acceptsJSON := accept == "" || strings.Contains(accept, "application/json") || strings.Contains(accept, "*/*")
@@ -322,6 +324,10 @@ func (j *jsonResponder) Start() error {
 		return nil
 	}
 	return j.sse.Start()
+}
+
+func (j *jsonResponder) Respond(resp Response) error {
+	return j.sendResponse(resp)
 }
 
 func (j *jsonResponder) Send(n Notification) error {

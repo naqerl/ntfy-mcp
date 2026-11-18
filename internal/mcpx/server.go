@@ -33,13 +33,21 @@ type EventProvider interface {
 	ListEvents() []EventDescriptor
 	PollEvents(ctx context.Context, params json.RawMessage) (any, error)
 	StreamEvents(ctx context.Context, params json.RawMessage, emit func(Notification) error) error
+	// SubscribeEvents registers a push subscription, calls respond with the
+	// subscription result before the first event frame, and blocks until the
+	// subscription ends. Events are pushed through emit.
+	SubscribeEvents(ctx context.Context, params json.RawMessage, respond func(result any) error, emit func(Notification) error) error
+	// UnsubscribeEvents cancels a subscription by id or by event selector.
+	UnsubscribeEvents(ctx context.Context, params json.RawMessage) (any, error)
 }
 
-// Responder is the transport side of a single JSON-RPC request. StreamEvents
-// uses Send to push notifications on the originating request stream.
+// Responder is the transport side of a single JSON-RPC request. Streaming
+// methods use Respond for the immediate result and Send to push notifications
+// on the originating request stream.
 type Responder interface {
 	SSE() bool
 	Start() error
+	Respond(Response) error
 	Send(Notification) error
 }
 
@@ -140,10 +148,38 @@ func (s *Server) Handle(ctx context.Context, req Request, r Responder) (any, *Er
 		}
 		return nil, nil
 
-	case "events/subscribe", "events/unsubscribe", "subscriptions/listen":
-		// SEP-3415 allows servers that only implement push+poll to omit the
-		// subscription control methods. listChanged is false, so these stay
-		// method-not-found rather than being silently accepted.
+	case "events/subscribe":
+		if s.Events == nil {
+			return nil, methodNotFound(req.Method)
+		}
+		if !r.SSE() {
+			return nil, NewError(CodeUnsupported,
+				"events/subscribe requires text/event-stream", map[string]any{
+					"feature": "events/subscribe",
+					"value":   "Accept",
+				})
+		}
+		respond := func(result any) error {
+			return r.Respond(SuccessResponse(req.ID, completeMap(result)))
+		}
+		if err := s.Events.SubscribeEvents(ctx, req.Params, respond, r.Send); err != nil {
+			return nil, asRPCError(err)
+		}
+		return nil, nil
+
+	case "events/unsubscribe":
+		if s.Events == nil {
+			return nil, methodNotFound(req.Method)
+		}
+		result, err := s.Events.UnsubscribeEvents(ctx, req.Params)
+		if err != nil {
+			return nil, asRPCError(err)
+		}
+		return completeMap(result), nil
+
+	case "subscriptions/listen":
+		// SEP-3415 listChanged is false: a listening client is served through
+		// events/subscribe instead of the subscription-list method.
 		return nil, methodNotFound(req.Method)
 	}
 
@@ -215,7 +251,11 @@ func (s *Server) negotiate(req Request) *Error {
 }
 
 func isExtensionMethod(method string) bool {
-	return method == "events/list" || method == "events/poll" || method == "events/stream"
+	switch method {
+	case "events/list", "events/poll", "events/stream", "events/subscribe", "events/unsubscribe":
+		return true
+	}
+	return false
 }
 
 // initializeResult answers the legacy 2025-11-25 initialize handshake. The

@@ -667,3 +667,322 @@ func TestParseParamsRejectsEnvelopeWithoutArguments(t *testing.T) {
 		t.Fatalf("code = %d", rpcErr.Code)
 	}
 }
+
+// --- subscribe tests --------------------------------------------------------
+
+func startSubscribe(t *testing.T, svc *Service, params string) (<-chan any, <-chan mcpx.Notification, <-chan error, context.CancelFunc) {
+	t.Helper()
+	ctx, cancel := context.WithCancel(context.Background())
+	results := make(chan any, 1)
+	notes := make(chan mcpx.Notification, 64)
+	errs := make(chan error, 1)
+	go func() {
+		errs <- svc.SubscribeEvents(ctx, json.RawMessage(params), func(result any) error {
+			results <- result
+			return nil
+		}, func(n mcpx.Notification) error {
+			notes <- n
+			return nil
+		})
+	}()
+	return results, notes, errs, cancel
+}
+
+func waitSubscribeResult(t *testing.T, ch <-chan any) map[string]any {
+	t.Helper()
+	select {
+	case result := <-ch:
+		m, ok := result.(map[string]any)
+		if !ok {
+			t.Fatalf("result = %T", result)
+		}
+		return m
+	case <-time.After(3 * time.Second):
+		t.Fatal("timed out waiting for the subscribe result")
+		return nil
+	}
+}
+
+func TestSubscribeRepliesWithIDAndPushesEvent(t *testing.T) {
+	release := make(chan struct{})
+	var gotSince string
+	svc, closeSrv := realService(t, func(w http.ResponseWriter, r *http.Request) {
+		gotSince = r.URL.Query().Get("since")
+		w.Header().Set("Content-Type", "application/x-ndjson")
+		rc := http.NewResponseController(w)
+		_ = rc.Flush()
+		_, _ = w.Write([]byte(`{"id":"","time":10,"event":"open","topic":"alerts"}` + "\n"))
+		_ = rc.Flush()
+		<-release
+		m := ntfy.Message{ID: "m1", Time: 1700000001, Event: "message", Topic: "alerts", Message: "hello"}
+		_ = json.NewEncoder(w).Encode(m)
+		_ = rc.Flush()
+		<-r.Context().Done()
+	}, Options{Heartbeat: time.Hour})
+	defer closeSrv()
+	at := time.Unix(1700000000, 0)
+	svc.now = func() time.Time { return at }
+
+	results, notes, errs, cancel := startSubscribe(t, svc, `{"name":"ntfy.message","arguments":{"topic":"alerts"}}`)
+	defer cancel()
+	result := waitSubscribeResult(t, results)
+	sid, _ := result["subscriptionId"].(string)
+	if !strings.HasPrefix(sid, "sub_") || result["event"] != EventName {
+		t.Fatalf("result = %+v", result)
+	}
+	active := waitNotification(t, notes, activeMethod)
+	if active.Params.(map[string]any)["subscriptionId"] != sid {
+		t.Fatalf("active = %+v", active.Params)
+	}
+	if gotSince != strconv.FormatInt(at.Unix(), 10) {
+		t.Fatalf("upstream since = %q", gotSince)
+	}
+
+	close(release)
+	msg := waitNotification(t, notes, eventMethod)
+	params := msg.Params.(map[string]any)
+	if params["eventId"] != "m1" || params["subscriptionId"] != sid {
+		t.Fatalf("message = %+v", params)
+	}
+
+	cancel()
+	select {
+	case <-errs:
+	case <-time.After(time.Second):
+		t.Fatal("subscription did not stop")
+	}
+}
+
+func TestSubscribeHonoursMaxAgeReplayFloor(t *testing.T) {
+	at := time.Unix(1700000000, 0)
+	var gotSince string
+	svc, closeSrv := realService(t, func(w http.ResponseWriter, r *http.Request) {
+		gotSince = r.URL.Query().Get("since")
+		w.Header().Set("Content-Type", "application/x-ndjson")
+		_ = http.NewResponseController(w).Flush()
+		<-r.Context().Done()
+	}, Options{Heartbeat: time.Hour})
+	defer closeSrv()
+	svc.now = func() time.Time { return at }
+
+	results, notes, _, cancel := startSubscribe(t, svc, `{"name":"ntfy.message","arguments":{"topic":"t"},"cursor":"t1000","maxAgeMs":100000}`)
+	defer cancel()
+	_ = waitSubscribeResult(t, results)
+	active := waitNotification(t, notes, activeMethod)
+	if active.Params.(map[string]any)["truncated"] != true {
+		t.Fatalf("active = %+v", active.Params)
+	}
+	want := strconv.FormatInt(at.Add(-100*time.Second).Unix(), 10)
+	if gotSince != want {
+		t.Fatalf("since = %q, want %q", gotSince, want)
+	}
+}
+
+func TestSubscribeUnsubscribeStopsDelivery(t *testing.T) {
+	svc, closeSrv := realService(t, func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/x-ndjson")
+		rc := http.NewResponseController(w)
+		_ = rc.Flush()
+		_, _ = w.Write([]byte(`{"id":"","time":10,"event":"open","topic":"t"}` + "\n"))
+		_ = rc.Flush()
+		<-r.Context().Done()
+	}, Options{Heartbeat: time.Hour})
+	defer closeSrv()
+
+	results, notes, errs, cancel := startSubscribe(t, svc, `{"event":"ntfy.message","filter":{"topic":"t"},"subscriptionId":"fixed"}`)
+	defer cancel()
+	if result := waitSubscribeResult(t, results); result["subscriptionId"] != "fixed" {
+		t.Fatalf("result = %+v", result)
+	}
+	_ = waitNotification(t, notes, activeMethod)
+
+	out, err := svc.UnsubscribeEvents(context.Background(), json.RawMessage(`{"subscriptionId":"fixed"}`))
+	if err != nil {
+		t.Fatalf("unsubscribe: %v", err)
+	}
+	m := out.(map[string]any)
+	ids := m["subscriptionIds"].([]string)
+	if m["unsubscribed"] != true || len(ids) != 1 || ids[0] != "fixed" {
+		t.Fatalf("unsubscribe result = %+v", m)
+	}
+	select {
+	case <-errs:
+	case <-time.After(time.Second):
+		t.Fatal("subscription goroutine did not exit")
+	}
+
+	_, err = svc.UnsubscribeEvents(context.Background(), json.RawMessage(`{"subscriptionId":"fixed"}`))
+	var rpcErr *mcpx.Error
+	if !errors.As(err, &rpcErr) || rpcErr.Code != mcpx.CodeNotFound {
+		t.Fatalf("unknown id error = %v", err)
+	}
+	svc.subsMu.Lock()
+	n := len(svc.subs)
+	svc.subsMu.Unlock()
+	if n != 0 {
+		t.Fatalf("registry still holds %d subscription(s)", n)
+	}
+}
+
+func TestSubscribeUnknownEventDoesNotOpenUpstream(t *testing.T) {
+	fake := &fakeClient{}
+	svc := New(fake, Options{})
+	responded := false
+	err := svc.SubscribeEvents(context.Background(), json.RawMessage(`{"name":"other","arguments":{"topic":"t"}}`),
+		func(any) error { responded = true; return nil },
+		func(mcpx.Notification) error { return nil })
+	var rpcErr *mcpx.Error
+	if !errors.As(err, &rpcErr) || rpcErr.Code != mcpx.CodeNotFound {
+		t.Fatalf("error = %v", err)
+	}
+	if rpcErr.Data.(map[string]any)["kind"] != "event" {
+		t.Fatalf("data = %+v", rpcErr.Data)
+	}
+	if fake.openCalls != 0 {
+		t.Fatal("upstream opened for unknown event")
+	}
+	if responded {
+		t.Fatal("responded before validation")
+	}
+}
+
+func TestSubscribeTwoTopicsAreIsolated(t *testing.T) {
+	release := make(chan struct{})
+	svc, closeSrv := realService(t, func(w http.ResponseWriter, r *http.Request) {
+		topic := strings.TrimSuffix(strings.TrimPrefix(r.URL.Path, "/"), "/json")
+		w.Header().Set("Content-Type", "application/x-ndjson")
+		rc := http.NewResponseController(w)
+		_ = rc.Flush()
+		_, _ = w.Write([]byte(`{"id":"","time":10,"event":"open"}` + "\n"))
+		_ = rc.Flush()
+		<-release
+		m := ntfy.Message{ID: "m-" + topic, Time: 1700000001, Event: "message", Topic: topic, Message: "hello-" + topic}
+		_ = json.NewEncoder(w).Encode(m)
+		_ = rc.Flush()
+		<-r.Context().Done()
+	}, Options{Heartbeat: time.Hour})
+	defer closeSrv()
+
+	resultsA, notesA, _, cancelA := startSubscribe(t, svc, `{"event":"ntfy.message","filter":{"topic":"alerts"}}`)
+	defer cancelA()
+	resultsB, notesB, _, cancelB := startSubscribe(t, svc, `{"event":"ntfy.message","filter":{"topic":"other"}}`)
+	defer cancelB()
+	_ = waitSubscribeResult(t, resultsA)
+	_ = waitSubscribeResult(t, resultsB)
+	_ = waitNotification(t, notesA, activeMethod)
+	_ = waitNotification(t, notesB, activeMethod)
+
+	close(release)
+	msgA := waitNotification(t, notesA, eventMethod)
+	msgB := waitNotification(t, notesB, eventMethod)
+	if msgA.Params.(map[string]any)["eventId"] != "m-alerts" {
+		t.Fatalf("A = %+v", msgA.Params)
+	}
+	if msgB.Params.(map[string]any)["eventId"] != "m-other" {
+		t.Fatalf("B = %+v", msgB.Params)
+	}
+	select {
+	case n := <-notesA:
+		if n.Method == eventMethod {
+			t.Fatalf("A received another subscription's event: %+v", n)
+		}
+	case <-time.After(100 * time.Millisecond):
+	}
+}
+
+func TestUnsubscribeBySelectorAndUnknownID(t *testing.T) {
+	svc := New(nil, Options{})
+	cancelled := map[string]int{}
+	svc.subs["a"] = &activeSubscription{id: "a", cancel: func() { cancelled["a"]++ }, filter: Filter{Topic: "a", Tags: []string{"x"}}}
+	svc.subs["b"] = &activeSubscription{id: "b", cancel: func() { cancelled["b"]++ }, filter: Filter{Topic: "b"}}
+
+	out, err := svc.UnsubscribeEvents(context.Background(), json.RawMessage(`{"name":"ntfy.message","arguments":{"topic":"a","tags":["x"]}}`))
+	if err != nil {
+		t.Fatalf("selector unsubscribe: %v", err)
+	}
+	m := out.(map[string]any)
+	ids := m["subscriptionIds"].([]string)
+	if len(ids) != 1 || ids[0] != "a" || cancelled["a"] != 1 || cancelled["b"] != 0 {
+		t.Fatalf("result=%+v cancelled=%+v", m, cancelled)
+	}
+	if _, ok := svc.subs["b"]; !ok {
+		t.Fatal("selector removed the wrong subscription")
+	}
+
+	_, err = svc.UnsubscribeEvents(context.Background(), json.RawMessage(`{"subscriptionId":"missing"}`))
+	var rpcErr *mcpx.Error
+	if !errors.As(err, &rpcErr) || rpcErr.Code != mcpx.CodeNotFound {
+		t.Fatalf("unknown id error = %v", err)
+	}
+	if rpcErr.Data.(map[string]any)["kind"] != "subscription" {
+		t.Fatalf("data = %+v", rpcErr.Data)
+	}
+
+	_, err = svc.UnsubscribeEvents(context.Background(), json.RawMessage(`{"name":"ntfy.message","arguments":{"topic":"zzz"}}`))
+	if !errors.As(err, &rpcErr) || rpcErr.Code != mcpx.CodeNotFound {
+		t.Fatalf("no-match selector error = %v", err)
+	}
+}
+
+func TestSubscribeDuplicateIDRejected(t *testing.T) {
+	svc, closeSrv := realService(t, func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/x-ndjson")
+		_ = http.NewResponseController(w).Flush()
+		<-r.Context().Done()
+	}, Options{Heartbeat: time.Hour})
+	defer closeSrv()
+
+	results, _, _, cancel := startSubscribe(t, svc, `{"event":"ntfy.message","filter":{"topic":"t"},"subscriptionId":"dup"}`)
+	defer cancel()
+	_ = waitSubscribeResult(t, results)
+
+	err := svc.SubscribeEvents(context.Background(), json.RawMessage(`{"event":"ntfy.message","filter":{"topic":"t"},"subscriptionId":"dup"}`),
+		func(any) error { return nil }, func(mcpx.Notification) error { return nil })
+	var rpcErr *mcpx.Error
+	if !errors.As(err, &rpcErr) || rpcErr.Code != mcpx.CodeInvalidParams {
+		t.Fatalf("duplicate id error = %v", err)
+	}
+}
+
+func TestSubscribeConcurrencyCap(t *testing.T) {
+	svc := New(nil, Options{})
+	for i := 0; i < maxSubscriptions; i++ {
+		id := "s" + strconv.Itoa(i)
+		svc.subs[id] = &activeSubscription{id: id, cancel: func() {}, filter: Filter{Topic: "t"}}
+	}
+	err := svc.SubscribeEvents(context.Background(), json.RawMessage(`{"event":"ntfy.message","filter":{"topic":"t"}}`),
+		func(any) error { return nil }, func(mcpx.Notification) error { return nil })
+	var rpcErr *mcpx.Error
+	if !errors.As(err, &rpcErr) || rpcErr.Code != mcpx.CodeResourceExhausted {
+		t.Fatalf("cap error = %v", err)
+	}
+}
+
+func TestSubscribeCancelReleasesRegistry(t *testing.T) {
+	svc, closeSrv := realService(t, func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/x-ndjson")
+		_ = http.NewResponseController(w).Flush()
+		<-r.Context().Done()
+	}, Options{Heartbeat: time.Hour})
+	defer closeSrv()
+
+	for i := 0; i < 5; i++ {
+		results, _, errs, cancel := startSubscribe(t, svc, `{"event":"ntfy.message","filter":{"topic":"t"},"subscriptionId":"loop"}`)
+		_ = waitSubscribeResult(t, results)
+		if _, err := svc.UnsubscribeEvents(context.Background(), json.RawMessage(`{"subscriptionId":"loop"}`)); err != nil {
+			t.Fatalf("iteration %d: unsubscribe: %v", i, err)
+		}
+		select {
+		case <-errs:
+		case <-time.After(time.Second):
+			t.Fatalf("iteration %d: subscription goroutine did not exit", i)
+		}
+		cancel()
+	}
+	svc.subsMu.Lock()
+	n := len(svc.subs)
+	svc.subsMu.Unlock()
+	if n != 0 {
+		t.Fatalf("registry = %d entries", n)
+	}
+}

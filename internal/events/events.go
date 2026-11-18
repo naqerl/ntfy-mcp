@@ -11,6 +11,7 @@ import (
 	"fmt"
 	"io"
 	"regexp"
+	"sort"
 	"strconv"
 	"strings"
 	"sync"
@@ -30,6 +31,10 @@ const (
 	heartbeatMethod = "notifications/events/heartbeat"
 
 	maxSeen = 4096
+
+	// maxSubscriptions bounds concurrent push subscriptions so a client cannot
+	// exhaust the process with repeated subscribe calls.
+	maxSubscriptions = 32
 )
 
 var (
@@ -63,6 +68,18 @@ type Service struct {
 
 	mu   sync.Mutex
 	seen map[string]int64
+
+	subsMu sync.Mutex
+	subs   map[string]*activeSubscription
+}
+
+// activeSubscription is a registered push subscription. cancel stops the
+// forwarded stream; filter is retained so events/unsubscribe can select by
+// name and arguments when the client does not echo the id.
+type activeSubscription struct {
+	id     string
+	cancel context.CancelFunc
+	filter Filter
 }
 
 // New constructs the events service.
@@ -87,6 +104,7 @@ func New(client Client, opts Options) *Service {
 		streamMax: opts.StreamMax,
 		now:       time.Now,
 		seen:      make(map[string]int64),
+		subs:      make(map[string]*activeSubscription),
 	}
 }
 
@@ -464,12 +482,33 @@ func (s *Service) StreamEvents(ctx context.Context, raw json.RawMessage, emit fu
 	if err != nil {
 		return err
 	}
-	now := s.now()
 	sid := p.SubscriptionID
 	if sid == "" {
 		sid = newSubscriptionID()
 	}
+	setup, oerr := s.openStream(ctx, p, cursorParam)
+	if oerr != nil {
+		return oerr
+	}
+	defer setup.stream.Close()
 
+	return s.forward(ctx, setup, p, sid, emit)
+}
+
+// streamSetup is the opened upstream stream plus the cursor state derived from
+// the request.
+type streamSetup struct {
+	stream    *ntfy.Stream
+	cursor    Cursor
+	cursorOut string
+	truncated bool
+}
+
+// openStream resolves the cursor/maxAgeMs replay window and opens the upstream
+// NDJSON stream. It performs no I/O beyond opening the stream, so callers can
+// still report a clean JSON-RPC error before starting to push frames.
+func (s *Service) openStream(ctx context.Context, p eventParams, cursorParam *string) (*streamSetup, error) {
+	now := s.now()
 	var cursor Cursor
 	var since string
 	truncated := false
@@ -480,7 +519,7 @@ func (s *Service) StreamEvents(ctx context.Context, raw json.RawMessage, emit fu
 	} else {
 		parsed, perr := ParseCursor(*cursorParam)
 		if perr != nil {
-			return invalidParams(perr.Error())
+			return nil, invalidParams(perr.Error())
 		}
 		cursor = parsed
 		since, truncated = cursor.Since(now, time.Duration(p.MaxAgeMs)*time.Millisecond)
@@ -488,10 +527,8 @@ func (s *Service) StreamEvents(ctx context.Context, raw json.RawMessage, emit fu
 
 	stream, oerr := s.client.OpenStream(ctx, p.Filter.Topic, since)
 	if oerr != nil {
-		return mapUpstreamError(oerr)
+		return nil, mapUpstreamError(oerr)
 	}
-	defer stream.Close()
-
 	if stream.Truncated {
 		truncated = true
 	}
@@ -499,8 +536,17 @@ func (s *Service) StreamEvents(ctx context.Context, raw json.RawMessage, emit fu
 	if cursorParam != nil {
 		cursorOut = *cursorParam
 	}
-	reportedGap := truncated
-	if eerr := emit(activeNotification(sid, EventName, cursorOut, truncated)); eerr != nil {
+	return &streamSetup{stream: stream, cursor: cursor, cursorOut: cursorOut, truncated: truncated}, nil
+}
+
+// forward pushes the active frame and then every matching message until ctx
+// ends, the stream max age elapses, or upstream closes.
+func (s *Service) forward(ctx context.Context, setup *streamSetup, p eventParams, sid string, emit func(mcpx.Notification) error) error {
+	stream := setup.stream
+	cursor := setup.cursor
+	cursorOut := setup.cursorOut
+	reportedGap := setup.truncated
+	if eerr := emit(activeNotification(sid, EventName, cursorOut, setup.truncated)); eerr != nil {
 		return eerr
 	}
 
@@ -594,6 +640,230 @@ func (s *Service) StreamEvents(ctx context.Context, raw json.RawMessage, emit fu
 			}
 		}
 	}
+}
+
+// SubscribeEvents registers a push subscription, replies with its stable
+// subscription id, and then forwards events until the subscription is
+// cancelled (events/unsubscribe), the caller's context ends, or upstream
+// closes. Validation matches events/poll and events/stream.
+func (s *Service) SubscribeEvents(ctx context.Context, raw json.RawMessage, respond func(any) error, emit func(mcpx.Notification) error) error {
+	p, err := parseParams(raw)
+	if err != nil {
+		return err
+	}
+	cursorParam, err := parseCursorParam(p.Cursor)
+	if err != nil {
+		return err
+	}
+	sid := p.SubscriptionID
+	if sid == "" {
+		sid = newSubscriptionID()
+	}
+
+	subCtx, cancel := context.WithCancel(ctx)
+	defer cancel()
+
+	if rerr := s.addSubscription(sid, cancel, *p.Filter); rerr != nil {
+		return rerr
+	}
+	defer s.removeSubscription(sid)
+
+	// Open upstream before replying so a failure is a clean JSON-RPC error
+	// rather than an error frame following a successful result.
+	setup, oerr := s.openStream(subCtx, p, cursorParam)
+	if oerr != nil {
+		return oerr
+	}
+	defer setup.stream.Close()
+
+	if rerr := respond(map[string]any{
+		"subscriptionId": sid,
+		"event":          EventName,
+		"cursor":         setup.cursorOut,
+		"_meta":          subscriptionMeta(sid),
+	}); rerr != nil {
+		return rerr
+	}
+	return s.forward(subCtx, setup, p, sid, emit)
+}
+
+// UnsubscribeEvents cancels one subscription by id, or every subscription that
+// matches an event selector when no id is supplied.
+func (s *Service) UnsubscribeEvents(_ context.Context, raw json.RawMessage) (any, error) {
+	sel, err := parseUnsubscribe(raw)
+	if err != nil {
+		return nil, err
+	}
+
+	s.subsMu.Lock()
+	defer s.subsMu.Unlock()
+
+	if sel.subscriptionID != "" {
+		sub, ok := s.subs[sel.subscriptionID]
+		if !ok {
+			return nil, subscriptionNotFound(sel.subscriptionID)
+		}
+		delete(s.subs, sub.id)
+		sub.cancel()
+		return map[string]any{
+			"unsubscribed":    true,
+			"subscriptionIds": []string{sub.id},
+		}, nil
+	}
+
+	ids := make([]string, 0, 1)
+	for id, sub := range s.subs {
+		if sel.matches(sub) {
+			delete(s.subs, id)
+			sub.cancel()
+			ids = append(ids, id)
+		}
+	}
+	if len(ids) == 0 {
+		return nil, mcpx.NewError(mcpx.CodeNotFound, "no matching subscription",
+			map[string]any{"kind": "subscription"})
+	}
+	sort.Strings(ids)
+	return map[string]any{
+		"unsubscribed":    true,
+		"subscriptionIds": ids,
+	}, nil
+}
+
+func (s *Service) addSubscription(id string, cancel context.CancelFunc, filter Filter) error {
+	s.subsMu.Lock()
+	defer s.subsMu.Unlock()
+	if s.subs == nil {
+		s.subs = make(map[string]*activeSubscription)
+	}
+	if _, exists := s.subs[id]; exists {
+		return invalidParams(fmt.Sprintf("subscription %q already exists", id))
+	}
+	if len(s.subs) >= maxSubscriptions {
+		return mcpx.NewError(mcpx.CodeResourceExhausted,
+			fmt.Sprintf("too many concurrent subscriptions (max %d)", maxSubscriptions),
+			map[string]any{"kind": "subscription", "limit": maxSubscriptions})
+	}
+	s.subs[id] = &activeSubscription{id: id, cancel: cancel, filter: filter}
+	return nil
+}
+
+func (s *Service) removeSubscription(id string) {
+	s.subsMu.Lock()
+	delete(s.subs, id)
+	s.subsMu.Unlock()
+}
+
+// unsubscribeSelector is either an id or an event/filter selector. An empty
+// event matches every registered event type.
+type unsubscribeSelector struct {
+	subscriptionID string
+	event          string
+	filter         *Filter
+}
+
+func (sel unsubscribeSelector) matches(sub *activeSubscription) bool {
+	if sel.event != "" && sel.event != EventName {
+		return false
+	}
+	if sel.filter == nil {
+		return true
+	}
+	if sel.filter.Topic != "" && sel.filter.Topic != sub.filter.Topic {
+		return false
+	}
+	if sel.filter.MinPriority != nil {
+		if sub.filter.MinPriority == nil || *sub.filter.MinPriority != *sel.filter.MinPriority {
+			return false
+		}
+	}
+	for _, want := range sel.filter.Tags {
+		found := false
+		for _, have := range sub.filter.Tags {
+			if have == want {
+				found = true
+				break
+			}
+		}
+		if !found {
+			return false
+		}
+	}
+	return true
+}
+
+// parseUnsubscribe accepts {"subscriptionId":…}, _meta.subscriptionId, or the
+// SEP-3415 selector {"name":<event>,"arguments":{…}}. The stream-envelope
+// unwrapping is reused so a selector looks exactly like a subscribe request.
+func parseUnsubscribe(raw json.RawMessage) (unsubscribeSelector, *mcpx.Error) {
+	var sel unsubscribeSelector
+	if len(strings.TrimSpace(string(raw))) == 0 {
+		return sel, invalidParams("params are required")
+	}
+	var p struct {
+		SubscriptionID string   `json:"subscriptionId"`
+		Event          string   `json:"event"`
+		Name           string   `json:"name"`
+		Filter         *Filter  `json:"filter"`
+		Topic          string   `json:"topic"`
+		Tags           []string `json:"tags"`
+		MinPriority    *int     `json:"minPriority"`
+		Meta           struct {
+			SubscriptionID string `json:"subscriptionId"`
+		} `json:"_meta"`
+	}
+	if err := json.Unmarshal(unwrapEventEnvelope(raw), &p); err != nil {
+		return sel, invalidParams("invalid params: " + err.Error())
+	}
+	sel.subscriptionID = strings.TrimSpace(p.SubscriptionID)
+	if sel.subscriptionID == "" {
+		sel.subscriptionID = strings.TrimSpace(p.Meta.SubscriptionID)
+	}
+	sel.event = p.Event
+	if sel.event == "" {
+		sel.event = p.Name
+	}
+	if sel.subscriptionID != "" {
+		return sel, nil
+	}
+	if sel.event != "" && sel.event != EventName {
+		return sel, mcpx.NewError(mcpx.CodeNotFound,
+			fmt.Sprintf("unknown event %q", sel.event),
+			map[string]any{"kind": "event", "event": sel.event})
+	}
+
+	filter := Filter{}
+	if p.Filter != nil {
+		filter = *p.Filter
+	}
+	if filter.Topic == "" {
+		filter.Topic = p.Topic
+	}
+	if len(filter.Tags) == 0 {
+		filter.Tags = p.Tags
+	}
+	if filter.MinPriority == nil {
+		filter.MinPriority = p.MinPriority
+	}
+	filter.Topic = strings.TrimSpace(filter.Topic)
+	if filter.Topic != "" {
+		if err := filter.validate(); err != nil {
+			return sel, err
+		}
+	}
+	if sel.event == "" && filter.Topic == "" && len(filter.Tags) == 0 && filter.MinPriority == nil {
+		return sel, invalidParams("subscriptionId or an event selector is required")
+	}
+	if filter.Topic != "" || len(filter.Tags) > 0 || filter.MinPriority != nil {
+		sel.filter = &filter
+	}
+	return sel, nil
+}
+
+func subscriptionNotFound(id string) *mcpx.Error {
+	return mcpx.NewError(mcpx.CodeNotFound,
+		fmt.Sprintf("unknown subscription %q", id),
+		map[string]any{"kind": "subscription", "subscriptionId": id})
 }
 
 // Payload is the ntfy.message event payload.

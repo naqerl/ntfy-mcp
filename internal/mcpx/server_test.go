@@ -33,8 +33,16 @@ type fakeEvents struct {
 	streamErr  error
 	stream     func(ctx context.Context, raw json.RawMessage, emit func(Notification) error) error
 
-	pollCalls   int
-	streamCalls int
+	subscribe         func(ctx context.Context, raw json.RawMessage, respond func(any) error, emit func(Notification) error) error
+	subscribeErr      error
+	unsubscribe       func(ctx context.Context, raw json.RawMessage) (any, error)
+	unsubscribeResult any
+	unsubscribeErr    error
+
+	pollCalls        int
+	streamCalls      int
+	subscribeCalls   int
+	unsubscribeCalls int
 }
 
 func (f *fakeEvents) ListEvents() []EventDescriptor { return f.defs }
@@ -52,14 +60,36 @@ func (f *fakeEvents) StreamEvents(ctx context.Context, raw json.RawMessage, emit
 	return f.streamErr
 }
 
+func (f *fakeEvents) SubscribeEvents(ctx context.Context, raw json.RawMessage, respond func(any) error, emit func(Notification) error) error {
+	f.subscribeCalls++
+	if f.subscribe != nil {
+		return f.subscribe(ctx, raw, respond, emit)
+	}
+	return f.subscribeErr
+}
+
+func (f *fakeEvents) UnsubscribeEvents(ctx context.Context, raw json.RawMessage) (any, error) {
+	f.unsubscribeCalls++
+	if f.unsubscribe != nil {
+		return f.unsubscribe(ctx, raw)
+	}
+	return f.unsubscribeResult, f.unsubscribeErr
+}
+
 type fakeResponder struct {
-	sse     bool
-	started bool
-	sent    []Notification
+	sse       bool
+	started   bool
+	sent      []Notification
+	responses []Response
 }
 
 func (f *fakeResponder) SSE() bool    { return f.sse }
 func (f *fakeResponder) Start() error { f.started = true; return nil }
+func (f *fakeResponder) Respond(resp Response) error {
+	f.started = true
+	f.responses = append(f.responses, resp)
+	return nil
+}
 func (f *fakeResponder) Send(n Notification) error {
 	f.started = true
 	f.sent = append(f.sent, n)
@@ -382,6 +412,81 @@ func TestEventsStreamErrorBeforeEmit(t *testing.T) {
 	events := &fakeEvents{streamErr: NewError(CodeNotFound, "unknown event", map[string]any{"kind": "event"})}
 	srv := NewServer("test", nil, events)
 	_, rpcErr := srv.Handle(context.Background(), Request{Method: "events/stream", Params: json.RawMessage(`{}`)}, &fakeResponder{sse: true})
+	if rpcErr == nil || rpcErr.Code != CodeNotFound {
+		t.Fatalf("error = %v", rpcErr)
+	}
+}
+
+func TestEventsSubscribeRepliesThenStreams(t *testing.T) {
+	events := &fakeEvents{subscribe: func(_ context.Context, _ json.RawMessage, respond func(any) error, emit func(Notification) error) error {
+		if err := respond(map[string]any{"subscriptionId": "sub-1"}); err != nil {
+			return err
+		}
+		if err := emit(NewNotification("notifications/events/active", map[string]any{"subscriptionId": "sub-1"})); err != nil {
+			return err
+		}
+		return emit(NewNotification("notifications/events/event", map[string]any{"eventId": "m1"}))
+	}}
+	srv := NewServer("test", nil, events)
+	resp := &fakeResponder{sse: true}
+	result, rpcErr := srv.Handle(context.Background(), Request{
+		ID:     json.RawMessage(`7`),
+		Method: "events/subscribe",
+		Params: json.RawMessage(`{"name":"ntfy.message","arguments":{"topic":"t"}}`),
+	}, resp)
+	if rpcErr != nil {
+		t.Fatalf("subscribe: %v", rpcErr)
+	}
+	if result != nil {
+		t.Fatalf("result = %+v, want nil after responding", result)
+	}
+	if len(resp.responses) != 1 {
+		t.Fatalf("responses = %+v", resp.responses)
+	}
+	if string(resp.responses[0].ID) != "7" {
+		t.Fatalf("response id = %s", resp.responses[0].ID)
+	}
+	m, ok := resp.responses[0].Result.(map[string]any)
+	if !ok || m["subscriptionId"] != "sub-1" || m["resultType"] != "complete" {
+		t.Fatalf("response result = %+v", resp.responses[0].Result)
+	}
+	if len(resp.sent) != 2 || resp.sent[0].Method != "notifications/events/active" || resp.sent[1].Method != "notifications/events/event" {
+		t.Fatalf("sent = %+v", resp.sent)
+	}
+}
+
+func TestEventsSubscribeRequiresSSE(t *testing.T) {
+	events := &fakeEvents{}
+	srv := NewServer("test", nil, events)
+	_, rpcErr := srv.Handle(context.Background(), Request{Method: "events/subscribe", Params: json.RawMessage(`{}`)}, &fakeResponder{sse: false})
+	if rpcErr == nil || rpcErr.Code != CodeUnsupported {
+		t.Fatalf("error = %v", rpcErr)
+	}
+	if events.subscribeCalls != 0 {
+		t.Fatal("provider was called without an SSE response")
+	}
+}
+
+func TestEventsUnsubscribe(t *testing.T) {
+	events := &fakeEvents{unsubscribeResult: map[string]any{
+		"unsubscribed":    true,
+		"subscriptionIds": []string{"sub-1"},
+	}}
+	srv := NewServer("test", nil, events)
+	resp, rpcErr := srv.Handle(context.Background(), Request{
+		Method: "events/unsubscribe",
+		Params: json.RawMessage(`{"subscriptionId":"sub-1"}`),
+	}, &fakeResponder{})
+	if rpcErr != nil {
+		t.Fatalf("unsubscribe: %v", rpcErr)
+	}
+	m := resp.(map[string]any)
+	if m["unsubscribed"] != true || m["resultType"] != "complete" {
+		t.Fatalf("result = %+v", m)
+	}
+
+	events.unsubscribeErr = NewError(CodeNotFound, "unknown subscription", map[string]any{"kind": "subscription"})
+	_, rpcErr = srv.Handle(context.Background(), Request{Method: "events/unsubscribe", Params: json.RawMessage(`{"subscriptionId":"nope"}`)}, &fakeResponder{})
 	if rpcErr == nil || rpcErr.Code != CodeNotFound {
 		t.Fatalf("error = %v", rpcErr)
 	}
