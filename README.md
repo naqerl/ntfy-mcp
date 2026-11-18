@@ -155,7 +155,8 @@ implementation treats as an empty capability envelope.
 - `POST` with an unknown/expired session returns HTTP 404.
 - `GET` with a valid session opens the server-to-client SSE channel.
 - `DELETE` with a valid session terminates it and returns 204.
-- Requests must send `Accept: text/event-stream` for `events/stream`.
+- Requests must send `Accept: text/event-stream` for `events/stream` and
+  `events/subscribe` (both keep the POST open).
 - No credentials are accepted in URLs or query strings.
 
 ### Tools — exactly two
@@ -229,8 +230,23 @@ One event type is advertised:
 ```
 
 - `events/list` returns that descriptor.
-- `events/subscribe`, `events/unsubscribe`, and `subscriptions/listen` return
-  `-32601`; `listChanged` is `false`, so subscription control is not offered.
+- `events/subscribe` validates the event and filter like `events/poll`, then
+  replies immediately with a result carrying a stable `subscriptionId` (the
+  client's own `subscriptionId` is echoed when supplied) and keeps the POST
+  open as `text/event-stream`. From then on it pushes the same
+  `notifications/events/{active,event,heartbeat}` frames as `events/stream`
+  until the subscription is cancelled with `events/unsubscribe`, the client
+  disconnects, or `NTFY_STREAM_MAX` elapses. `cursor` and `maxAgeMs` replay
+  semantics are shared with `events/stream`.
+- `events/unsubscribe` cancels by `subscriptionId` (also accepted as
+  `_meta.subscriptionId`) or, when no id is sent, by the
+  `{"name":"ntfy.message","arguments":{…}}` selector; every matching
+  subscription is cancelled. Unknown ids and selectors return `-32023` with
+  `data.kind: "subscription"`.
+- At most 32 push subscriptions are active at once: a duplicate id returns
+  `-32602`, a full registry returns `-32025`.
+- `subscriptions/listen` returns `-32601`; `listChanged` is `false`, so the
+  subscription-list method is not offered.
 - Unknown event names return `-32023` with `data.kind: "event"`.
 - `events/poll` reads `maxEvents+1` upstream messages to compute `hasMore`,
   filters tags/priority, places `cursor` at the response level, and defaults
@@ -308,11 +324,11 @@ after the stream opens arrives as a `notifications/events/event` frame, and a
 | --- | --- |
 | `-32700` | JSON parse error |
 | `-32600` | invalid request / invalid batch |
-| `-32601` | absent method (`events/subscribe`, `events/unsubscribe`, `subscriptions/listen`, unknown methods) |
-| `-32602` | invalid params, invalid topic, reserved topic |
+| `-32601` | absent method (`subscriptions/listen`, unknown methods) |
+| `-32602` | invalid params, invalid topic, reserved topic, duplicate subscription id |
 | `-32603` | internal/upstream failure |
-| `-32023` | not found; unknown event (`data.kind: "event"`) or upstream 404 (`data.kind: "topic"`) |
-| `-32025` | resource exhausted; upstream 429 / replay-cache overrun |
+| `-32023` | not found; unknown event/subscription (`data.kind: "event"`/`"subscription"`) or upstream 404 (`data.kind: "topic"`) |
+| `-32025` | resource exhausted; upstream 429 / replay-cache overrun / subscription cap |
 | `-32026` | unsupported; older protocol revision or explicit client capability mismatch (`data: {feature, value}`) |
 
 ## Upstream contract used
@@ -372,8 +388,9 @@ the required-environment failure paths.
 `server/discover` with `listChanged:false`, exactly two tools, publish→read,
 `events/list`, a fresh stream with `active` and no cached history, a
 post-subscribe pushed message, a heartbeat, unknown event → `-32023`,
-`events/subscribe` → `-32601`, reserved topics, non-root container user, and
-refusal to start without `MCP_AUTH_TOKEN`/`NTFY_BASE_URL`.
+`events/subscribe` including its immediate result and a pushed event,
+`events/unsubscribe`, reserved topics, non-root container user, and refusal to
+start without `MCP_AUTH_TOKEN`/`NTFY_BASE_URL`.
 
 CI runs `vet` → `test` → `build` (linux/amd64 + linux/arm64) → `docker` (image,
 ntfy service container, smoke) and publishes multi-arch images to

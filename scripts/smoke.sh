@@ -16,13 +16,19 @@ command -v jq >/dev/null || { echo "smoke: jq is required" >&2; exit 1; }
 SESSION=""
 SESSION_FILE="$(mktemp)"
 FRAMES="$(mktemp)"
+SUB_FRAMES="$(mktemp)"
 STREAM_PID=""
+SUB_PID=""
 cleanup() {
   if [[ -n "$STREAM_PID" ]]; then
     kill "$STREAM_PID" 2>/dev/null || true
     wait "$STREAM_PID" 2>/dev/null || true
   fi
-  rm -f "$FRAMES" "$SESSION_FILE"
+  if [[ -n "$SUB_PID" ]]; then
+    kill "$SUB_PID" 2>/dev/null || true
+    wait "$SUB_PID" 2>/dev/null || true
+  fi
+  rm -f "$FRAMES" "$SUB_FRAMES" "$SESSION_FILE"
 }
 trap cleanup EXIT
 
@@ -40,6 +46,18 @@ wait_for() {
   local deadline=$((SECONDS + timeout))
   while (( SECONDS < deadline )); do
     if grep -q -- "$pattern" "$FRAMES"; then
+      return 0
+    fi
+    sleep 0.1
+  done
+  return 1
+}
+
+wait_for_file() {
+  local file="$1" pattern="$2" timeout="${3:-10}"
+  local deadline=$((SECONDS + timeout))
+  while (( SECONDS < deadline )); do
+    if grep -q -- "$pattern" "$file"; then
       return 0
     fi
     sleep 0.1
@@ -173,16 +191,56 @@ echo "smoke: heartbeat arrives within the configured interval"
 # CI sets NTFY_HEARTBEAT=2s. The default is 25s, still below the 30s ceiling.
 wait_for 'notifications/events/heartbeat' 35 || fail "no heartbeat notification"
 
-echo "smoke: unknown event -> -32023, subscription control -> -32601"
+echo "smoke: unknown event -> -32023"
 unknown="$(rpc "$(jq -nc --arg t "$TOPIC" \
   '{jsonrpc:"2.0",id:9,method:"events/poll",params:{event:"other",filter:{topic:$t}}}')")"
 jq -e '.error.code == -32023 and .error.data.kind == "event"' <<<"$unknown" >/dev/null ||
   fail "unknown event response: $unknown"
 
-subscribe="$(rpc "$(jq -nc --arg t "$TOPIC" \
-  '{jsonrpc:"2.0",id:10,method:"events/subscribe",params:{event:"ntfy.message",filter:{topic:$t}}}')")"
-jq -e '.error.code == -32601' <<<"$subscribe" >/dev/null ||
-  fail "events/subscribe response: $subscribe"
+echo "smoke: events/subscribe replies with an id and pushes an event"
+SUB_AFTER="subscribe-${RANDOM}-${RANDOM}"
+sub_payload="$(jq -nc --arg t "$TOPIC" \
+  '{jsonrpc:"2.0",id:10,method:"events/subscribe",params:{name:"ntfy.message",arguments:{topic:$t},subscriptionId:"smoke-subscribe"}}')"
+: >"$SUB_FRAMES"
+curl -sS -N -X POST "$MCP_URL" \
+  -H "Authorization: Bearer $MCP_AUTH_TOKEN" \
+  -H "Content-Type: application/json" \
+  -H "Accept: text/event-stream" \
+  -H "Mcp-Session-Id: $SESSION" \
+  --data-binary "$sub_payload" >"$SUB_FRAMES" 2>/dev/null &
+SUB_PID=$!
+
+wait_for_file "$SUB_FRAMES" '"subscriptionId":"smoke-subscribe"' 10 ||
+  fail "no subscribe result with the echoed id"
+wait_for_file "$SUB_FRAMES" 'notifications/events/active' 10 ||
+  fail "no active notification for events/subscribe"
+
+sub_after_payload="$(jq -nc --arg t "$TOPIC" --arg m "$SUB_AFTER" \
+  '{jsonrpc:"2.0",id:11,method:"tools/call",params:{name:"ntfy_publish",arguments:{topic:$t,message:$m}}}')"
+sub_after_result="$(rpc "$sub_after_payload")"
+jq -e '.result.structuredContent.id != null' <<<"$sub_after_result" >/dev/null ||
+  fail "publish for the subscription failed: $sub_after_result"
+wait_for_file "$SUB_FRAMES" "$SUB_AFTER" 10 ||
+  fail "subscribed message was not pushed"
+wait_for_file "$SUB_FRAMES" 'notifications/events/event' 10 ||
+  fail "no event frame for events/subscribe"
+
+echo "smoke: events/unsubscribe stops the subscription"
+unsubscribe="$(rpc '{"jsonrpc":"2.0","id":12,"method":"events/unsubscribe","params":{"subscriptionId":"smoke-subscribe"}}')"
+jq -e '.result.unsubscribed == true and (.result.subscriptionIds | index("smoke-subscribe"))' \
+  <<<"$unsubscribe" >/dev/null ||
+  fail "events/unsubscribe response: $unsubscribe"
+# The server closes the SSE response when the subscription is cancelled.
+for _ in $(seq 1 50); do
+  kill -0 "$SUB_PID" 2>/dev/null || break
+  sleep 0.1
+done
+if kill -0 "$SUB_PID" 2>/dev/null; then
+  fail "subscription stream did not close after events/unsubscribe"
+fi
+wait "$SUB_PID" 2>/dev/null || true
+SUB_PID=""
+grep -q 'notifications/events/event' "$SUB_FRAMES" || fail "subscription event frame disappeared"
 
 if [[ -n "$MCP_IMAGE" ]]; then
   command -v docker >/dev/null || fail "MCP_IMAGE set but docker is unavailable"

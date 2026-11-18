@@ -4,6 +4,40 @@ All notable changes to this project are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and this project uses
 [semantic versioning](https://semver.org/).
 
+## [0.1.3] - 2026-11-18
+
+### Added
+
+- `events/subscribe` implements the SEP-3415 subscription control method: it
+  validates the event and filter like `events/poll`, registers the
+  subscription, replies immediately with a stable `subscriptionId` (echoing
+  the client's own id when supplied), and then pushes the existing
+  `notifications/events/{active,event,heartbeat}` frames on the same
+  `text/event-stream` response. Delivery ends on `events/unsubscribe`, client
+  disconnect, or `NTFY_STREAM_MAX`.
+- `events/unsubscribe` cancels by `subscriptionId` (or `_meta.subscriptionId`)
+  and also accepts the `{"name":…,"arguments":{…}}` selector. Unknown ids and
+  selectors return `-32023` with `data.kind: "subscription"`.
+- Push subscriptions reuse the existing `cursor`/`maxAgeMs` replay window, so a
+  resumed subscription gets the same watermark, replay floor and
+  `truncated` reporting as `events/stream`.
+
+### Changed
+
+- Concurrent push subscriptions are capped at 32. A duplicate id returns
+  `-32602`; a full registry returns `-32025` with `data.kind: "subscription"`.
+- `events/subscribe` requires `Accept: text/event-stream` and is rejected in a
+  batch, like `events/stream`.
+- `subscriptions/listen` remains `-32601` (`listChanged` is still `false`).
+
+### Tests
+
+- Subscribe returns an id before any event frame; a published message arrives
+  as `notifications/events/event`; unsubscribe ends delivery and releases the
+  registry; two subscriptions do not receive each other's events; unknown
+  events open no upstream; the replay floor and the subscription cap are
+  covered.
+
 ## [0.1.2] - 2026-11-17
 
 ### Fixed

@@ -303,6 +303,41 @@ func TestEventsStreamSSE(t *testing.T) {
 	}
 }
 
+func TestEventsSubscribeSSE(t *testing.T) {
+	events := &fakeEvents{subscribe: func(_ context.Context, _ json.RawMessage, respond func(any) error, emit func(Notification) error) error {
+		if err := respond(map[string]any{"subscriptionId": "sub-http"}); err != nil {
+			return err
+		}
+		if err := emit(NewNotification("notifications/events/active", map[string]any{"subscriptionId": "sub-http"})); err != nil {
+			return err
+		}
+		return emit(NewNotification("notifications/events/event", map[string]any{"eventId": "m1"}))
+	}}
+	h := testHandler(events)
+	rr := doRequest(h, http.MethodPost,
+		`{"jsonrpc":"2.0","id":9,"method":"events/subscribe","params":{"name":"ntfy.message","arguments":{"topic":"t"}}}`,
+		"", "text/event-stream", "secret")
+	if rr.Code != http.StatusOK {
+		t.Fatalf("status = %d", rr.Code)
+	}
+	if ct := rr.Header().Get("Content-Type"); !strings.HasPrefix(ct, "text/event-stream") {
+		t.Fatalf("content-type = %q", ct)
+	}
+	body := rr.Body.String()
+	if strings.Count(body, "data: ") != 3 {
+		t.Fatalf("body = %q", body)
+	}
+	resultAt := strings.Index(body, `"result"`)
+	activeAt := strings.Index(body, "notifications/events/active")
+	eventAt := strings.Index(body, "notifications/events/event")
+	if resultAt < 0 || activeAt < 0 || eventAt < 0 || !(resultAt < activeAt && activeAt < eventAt) {
+		t.Fatalf("frames out of order: %q", body)
+	}
+	if !strings.Contains(body, `"subscriptionId":"sub-http"`) {
+		t.Fatalf("missing subscription id: %q", body)
+	}
+}
+
 func TestEventsStreamRequiresSSE(t *testing.T) {
 	h := testHandler(&fakeEvents{})
 	rr := doRequest(h, http.MethodPost,
