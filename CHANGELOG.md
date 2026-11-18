@@ -23,6 +23,12 @@ All notable changes to this project are documented here. The format follows
   it), so `events/stream` and `events/subscribe` no longer time out during
   activation. A client-supplied `subscriptionId` still wins; otherwise the
   request id is the subscription id.
+- The revision fix alone was not sufficient: after the stream opened, the
+  adapter still dropped the active frame because the SEP-3415 demux key was
+  absent. Commit `a8f42e5` (with the smoke follow-up `c77c83d`) defaults the
+  subscription id to the stream request id and stamps
+  `_meta["io.modelcontextprotocol/subscriptionId"]` on every notification,
+  which is what makes activation observable to the client.
 - `notifications/events/event` frames now expose the SEP-3415 payload fields
   `name`, `timestamp` and `data` alongside the existing `event`, `eventId`,
   `cursor` and `payload` fields, so consumers that validate the draft shape
