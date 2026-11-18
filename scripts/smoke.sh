@@ -172,6 +172,8 @@ curl -sS -N -X POST "$MCP_URL" \
 STREAM_PID=$!
 
 wait_for 'notifications/events/active' 10 || fail "no active notification"
+grep -q '"io.modelcontextprotocol/subscriptionId":"smoke-sub"' "$FRAMES" ||
+  fail "active frame is missing the SEP-3415 subscription demux key"
 sleep 0.3
 if grep -q -- "$CACHED" "$FRAMES"; then
   fail "cached message was replayed to a from-now subscription"

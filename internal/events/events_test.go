@@ -330,13 +330,17 @@ func TestPollMaxEventsDefaults(t *testing.T) {
 
 // --- stream tests -----------------------------------------------------------
 
-func startStream(t *testing.T, svc *Service, params string) (context.CancelFunc, <-chan mcpx.Notification, <-chan error) {
+func startStream(t *testing.T, svc *Service, params string, defaultSID ...string) (context.CancelFunc, <-chan mcpx.Notification, <-chan error) {
 	t.Helper()
 	ctx, cancel := context.WithCancel(context.Background())
 	notes := make(chan mcpx.Notification, 64)
 	errs := make(chan error, 1)
+	sid := ""
+	if len(defaultSID) > 0 {
+		sid = defaultSID[0]
+	}
 	go func() {
-		errs <- svc.StreamEvents(ctx, json.RawMessage(params), func(n mcpx.Notification) error {
+		errs <- svc.StreamEvents(ctx, json.RawMessage(params), sid, func(n mcpx.Notification) error {
 			notes <- n
 			return nil
 		})
@@ -536,7 +540,7 @@ func TestStreamTimeCursorMaxAgeFloor(t *testing.T) {
 func TestStreamUnknownEventDoesNotOpenUpstream(t *testing.T) {
 	fake := &fakeClient{}
 	svc := New(fake, Options{})
-	err := svc.StreamEvents(context.Background(), json.RawMessage(`{"event":"other","filter":{"topic":"t"}}`), func(mcpx.Notification) error { return nil })
+	err := svc.StreamEvents(context.Background(), json.RawMessage(`{"event":"other","filter":{"topic":"t"}}`), "", func(mcpx.Notification) error { return nil })
 	var rpcErr *mcpx.Error
 	if !errors.As(err, &rpcErr) || rpcErr.Code != mcpx.CodeNotFound {
 		t.Fatalf("error = %v", err)
@@ -554,7 +558,7 @@ func TestStreamOpenErrorMapsRateLimit(t *testing.T) {
 		return nil, &ntfy.APIError{Status: 429, Code: 42905, Message: "overrun"}
 	}}
 	svc := New(fake, Options{})
-	err := svc.StreamEvents(context.Background(), json.RawMessage(`{"event":"ntfy.message","filter":{"topic":"t"}}`), func(mcpx.Notification) error { return nil })
+	err := svc.StreamEvents(context.Background(), json.RawMessage(`{"event":"ntfy.message","filter":{"topic":"t"}}`), "", func(mcpx.Notification) error { return nil })
 	var rpcErr *mcpx.Error
 	if !errors.As(err, &rpcErr) || rpcErr.Code != mcpx.CodeResourceExhausted {
 		t.Fatalf("error = %v", err)
@@ -670,14 +674,18 @@ func TestParseParamsRejectsEnvelopeWithoutArguments(t *testing.T) {
 
 // --- subscribe tests --------------------------------------------------------
 
-func startSubscribe(t *testing.T, svc *Service, params string) (<-chan any, <-chan mcpx.Notification, <-chan error, context.CancelFunc) {
+func startSubscribe(t *testing.T, svc *Service, params string, defaultSID ...string) (<-chan any, <-chan mcpx.Notification, <-chan error, context.CancelFunc) {
 	t.Helper()
 	ctx, cancel := context.WithCancel(context.Background())
 	results := make(chan any, 1)
 	notes := make(chan mcpx.Notification, 64)
 	errs := make(chan error, 1)
+	sid := ""
+	if len(defaultSID) > 0 {
+		sid = defaultSID[0]
+	}
 	go func() {
-		errs <- svc.SubscribeEvents(ctx, json.RawMessage(params), func(result any) error {
+		errs <- svc.SubscribeEvents(ctx, json.RawMessage(params), sid, func(result any) error {
 			results <- result
 			return nil
 		}, func(n mcpx.Notification) error {
@@ -828,7 +836,7 @@ func TestSubscribeUnknownEventDoesNotOpenUpstream(t *testing.T) {
 	fake := &fakeClient{}
 	svc := New(fake, Options{})
 	responded := false
-	err := svc.SubscribeEvents(context.Background(), json.RawMessage(`{"name":"other","arguments":{"topic":"t"}}`),
+	err := svc.SubscribeEvents(context.Background(), json.RawMessage(`{"name":"other","arguments":{"topic":"t"}}`), "",
 		func(any) error { responded = true; return nil },
 		func(mcpx.Notification) error { return nil })
 	var rpcErr *mcpx.Error
@@ -936,7 +944,7 @@ func TestSubscribeDuplicateIDRejected(t *testing.T) {
 	defer cancel()
 	_ = waitSubscribeResult(t, results)
 
-	err := svc.SubscribeEvents(context.Background(), json.RawMessage(`{"event":"ntfy.message","filter":{"topic":"t"},"subscriptionId":"dup"}`),
+	err := svc.SubscribeEvents(context.Background(), json.RawMessage(`{"event":"ntfy.message","filter":{"topic":"t"},"subscriptionId":"dup"}`), "",
 		func(any) error { return nil }, func(mcpx.Notification) error { return nil })
 	var rpcErr *mcpx.Error
 	if !errors.As(err, &rpcErr) || rpcErr.Code != mcpx.CodeInvalidParams {
@@ -950,7 +958,7 @@ func TestSubscribeConcurrencyCap(t *testing.T) {
 		id := "s" + strconv.Itoa(i)
 		svc.subs[id] = &activeSubscription{id: id, cancel: func() {}, filter: Filter{Topic: "t"}}
 	}
-	err := svc.SubscribeEvents(context.Background(), json.RawMessage(`{"event":"ntfy.message","filter":{"topic":"t"}}`),
+	err := svc.SubscribeEvents(context.Background(), json.RawMessage(`{"event":"ntfy.message","filter":{"topic":"t"}}`), "",
 		func(any) error { return nil }, func(mcpx.Notification) error { return nil })
 	var rpcErr *mcpx.Error
 	if !errors.As(err, &rpcErr) || rpcErr.Code != mcpx.CodeResourceExhausted {
@@ -984,5 +992,76 @@ func TestSubscribeCancelReleasesRegistry(t *testing.T) {
 	svc.subsMu.Unlock()
 	if n != 0 {
 		t.Fatalf("registry = %d entries", n)
+	}
+}
+
+func TestStreamNotificationsUseSEP3415Shape(t *testing.T) {
+	svc, closeSrv := realService(t, func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/x-ndjson")
+		rc := http.NewResponseController(w)
+		_ = rc.Flush()
+		_, _ = w.Write([]byte(`{"id":"","time":10,"event":"open","topic":"t"}` + "\n"))
+		_ = rc.Flush()
+		m := ntfy.Message{ID: "m1", Time: 1700000001, Event: "message", Topic: "t", Message: "hello"}
+		_ = json.NewEncoder(w).Encode(m)
+		_ = rc.Flush()
+		<-r.Context().Done()
+	}, Options{Heartbeat: 40 * time.Millisecond})
+	defer closeSrv()
+
+	cancel, notes, _ := startStream(t, svc, `{"event":"ntfy.message","filter":{"topic":"t"}}`, "mcp-extension-abc-0")
+	defer cancel()
+
+	active := waitNotification(t, notes, activeMethod)
+	activeParams := active.Params.(map[string]any)
+	activeMeta := activeParams["_meta"].(map[string]any)
+	if activeMeta[subscriptionIDMetaKey] != "mcp-extension-abc-0" {
+		t.Fatalf("active _meta = %+v", activeMeta)
+	}
+	if activeParams["subscriptionId"] != "mcp-extension-abc-0" {
+		t.Fatalf("active subscriptionId = %v", activeParams["subscriptionId"])
+	}
+
+	msg := waitNotification(t, notes, eventMethod)
+	params := msg.Params.(map[string]any)
+	if params["name"] != EventName || params["eventId"] != "m1" || params["timestamp"] != "2023-11-14T22:13:21Z" {
+		t.Fatalf("event params = %+v", params)
+	}
+	data, ok := params["data"].(Payload)
+	if !ok || data.ID != "m1" || data.Message != "hello" || data.Topic != "t" {
+		t.Fatalf("data = %+v", params["data"])
+	}
+	meta := params["_meta"].(map[string]any)
+	if meta[subscriptionIDMetaKey] != "mcp-extension-abc-0" {
+		t.Fatalf("event _meta = %+v", meta)
+	}
+
+	heartbeat := waitNotification(t, notes, heartbeatMethod)
+	if got := heartbeat.Params.(map[string]any)["_meta"].(map[string]any)[subscriptionIDMetaKey]; got != "mcp-extension-abc-0" {
+		t.Fatalf("heartbeat meta = %+v", heartbeat.Params)
+	}
+}
+
+func TestSubscribeUsesRequestIDAsDefault(t *testing.T) {
+	svc, closeSrv := realService(t, func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/x-ndjson")
+		_ = http.NewResponseController(w).Flush()
+		<-r.Context().Done()
+	}, Options{Heartbeat: time.Hour})
+	defer closeSrv()
+
+	results, notes, _, cancel := startSubscribe(t, svc, `{"name":"ntfy.message","arguments":{"topic":"t"}}`, "mcp-extension-sub-1")
+	defer cancel()
+	result := waitSubscribeResult(t, results)
+	if result["subscriptionId"] != "mcp-extension-sub-1" {
+		t.Fatalf("result = %+v", result)
+	}
+	meta := result["_meta"].(map[string]any)
+	if meta[subscriptionIDMetaKey] != "mcp-extension-sub-1" {
+		t.Fatalf("result _meta = %+v", meta)
+	}
+	active := waitNotification(t, notes, activeMethod)
+	if got := active.Params.(map[string]any)["_meta"].(map[string]any)[subscriptionIDMetaKey]; got != "mcp-extension-sub-1" {
+		t.Fatalf("active = %+v", active.Params)
 	}
 }

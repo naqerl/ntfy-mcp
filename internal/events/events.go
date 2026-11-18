@@ -30,6 +30,10 @@ const (
 	eventMethod     = "notifications/events/event"
 	heartbeatMethod = "notifications/events/heartbeat"
 
+	// subscriptionIDMetaKey is the SEP-3415 notification demux key. Its value
+	// is the JSON-RPC id of the request that opened the stream.
+	subscriptionIDMetaKey = "io.modelcontextprotocol/subscriptionId"
+
 	maxSeen = 4096
 
 	// maxSubscriptions bounds concurrent push subscriptions so a client cannot
@@ -473,7 +477,7 @@ func (s *Service) PollEvents(ctx context.Context, raw json.RawMessage) (any, err
 
 // StreamEvents opens the upstream NDJSON subscription and pushes events until
 // the client disconnects, the stream max age elapses, or upstream closes.
-func (s *Service) StreamEvents(ctx context.Context, raw json.RawMessage, emit func(mcpx.Notification) error) error {
+func (s *Service) StreamEvents(ctx context.Context, raw json.RawMessage, subscriptionID string, emit func(mcpx.Notification) error) error {
 	p, err := parseParams(raw)
 	if err != nil {
 		return err
@@ -483,6 +487,9 @@ func (s *Service) StreamEvents(ctx context.Context, raw json.RawMessage, emit fu
 		return err
 	}
 	sid := p.SubscriptionID
+	if sid == "" {
+		sid = subscriptionID
+	}
 	if sid == "" {
 		sid = newSubscriptionID()
 	}
@@ -646,7 +653,7 @@ func (s *Service) forward(ctx context.Context, setup *streamSetup, p eventParams
 // subscription id, and then forwards events until the subscription is
 // cancelled (events/unsubscribe), the caller's context ends, or upstream
 // closes. Validation matches events/poll and events/stream.
-func (s *Service) SubscribeEvents(ctx context.Context, raw json.RawMessage, respond func(any) error, emit func(mcpx.Notification) error) error {
+func (s *Service) SubscribeEvents(ctx context.Context, raw json.RawMessage, subscriptionID string, respond func(any) error, emit func(mcpx.Notification) error) error {
 	p, err := parseParams(raw)
 	if err != nil {
 		return err
@@ -656,6 +663,9 @@ func (s *Service) SubscribeEvents(ctx context.Context, raw json.RawMessage, resp
 		return err
 	}
 	sid := p.SubscriptionID
+	if sid == "" {
+		sid = subscriptionID
+	}
 	if sid == "" {
 		sid = newSubscriptionID()
 	}
@@ -907,12 +917,16 @@ func activeNotification(sid, event, cursor string, truncated bool) mcpx.Notifica
 }
 
 func messageNotification(sid string, m ntfy.Message) mcpx.Notification {
+	payload := payloadFor(m)
 	params := map[string]any{
 		"event":          EventName,
+		"name":           EventName,
 		"eventId":        m.ID,
+		"timestamp":      payload.Time,
 		"cursor":         m.ID,
 		"subscriptionId": sid,
-		"payload":        payloadFor(m),
+		"payload":        payload,
+		"data":           payload,
 	}
 	if sid != "" {
 		params["_meta"] = subscriptionMeta(sid)
@@ -933,7 +947,11 @@ func heartbeatNotification(sid, event, cursor string) mcpx.Notification {
 }
 
 func subscriptionMeta(sid string) map[string]any {
-	return map[string]any{"subscriptionId": sid}
+	meta := map[string]any{"subscriptionId": sid}
+	if sid != "" {
+		meta[subscriptionIDMetaKey] = sid
+	}
+	return meta
 }
 
 func newSubscriptionID() string {

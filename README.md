@@ -232,12 +232,12 @@ One event type is advertised:
 - `events/list` returns that descriptor.
 - `events/subscribe` validates the event and filter like `events/poll`, then
   replies immediately with a result carrying a stable `subscriptionId` (the
-  client's own `subscriptionId` is echoed when supplied) and keeps the POST
-  open as `text/event-stream`. From then on it pushes the same
-  `notifications/events/{active,event,heartbeat}` frames as `events/stream`
-  until the subscription is cancelled with `events/unsubscribe`, the client
-  disconnects, or `NTFY_STREAM_MAX` elapses. `cursor` and `maxAgeMs` replay
-  semantics are shared with `events/stream`.
+  client's own `subscriptionId` when supplied, otherwise the JSON-RPC request
+  id) and keeps the POST open as `text/event-stream`. From then on it pushes
+  the same `notifications/events/{active,event,heartbeat}` frames as
+  `events/stream` until the subscription is cancelled with
+  `events/unsubscribe`, the client disconnects, or `NTFY_STREAM_MAX` elapses.
+  `cursor` and `maxAgeMs` replay semantics are shared with `events/stream`.
 - `events/unsubscribe` cancels by `subscriptionId` (also accepted as
   `_meta.subscriptionId`) or, when no id is sent, by the
   `{"name":"ntfy.message","arguments":{…}}` selector; every matching
@@ -255,10 +255,17 @@ One event type is advertised:
   frame with `http.NewResponseController(w).Flush()`, and emits JSON-RPC
   notifications as SSE `data:` frames:
   - `notifications/events/active` — watermark or replay state,
-  - `notifications/events/event` — one `ntfy.message` event,
+  - `notifications/events/event` — one `ntfy.message` event, carrying
+    `eventId`, `name`, `timestamp` and `data` (`payload` and `event` remain as
+    compatibility aliases),
   - `notifications/events/heartbeat` — advances the cursor on quiet topics.
 - `eventId` is the ntfy message id, so poll and push consumers can deduplicate.
-- `_meta.subscriptionId` is echoed in `params` and `params._meta`.
+- Every notification carries
+  `_meta["io.modelcontextprotocol/subscriptionId"]`, the SEP-3415 demux key.
+  Its value defaults to the JSON-RPC id of the request that opened the stream,
+  which is what clients such as `pi-mcp-events` route on. The legacy
+  `params.subscriptionId` and `_meta.subscriptionId` are still echoed for
+  compatibility.
 
 #### Cursor semantics
 

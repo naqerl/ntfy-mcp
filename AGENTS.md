@@ -29,6 +29,11 @@ not expose. Do not reintroduce the SDK just for transport convenience.
   carries a `t<unix>` watermark.
 - **Opaque cursor:** `t<unix>` before the first message, ntfy message id
   afterwards. `eventId` is the ntfy message id so poll/push dedupe works.
+- **Subscription demux:** every notification carries
+  `_meta["io.modelcontextprotocol/subscriptionId"]` equal to the JSON-RPC id
+  of the request that opened the stream (a client-supplied `subscriptionId`
+  wins). Event frames expose `name`, `timestamp` and `data`; the older
+  `event`/`payload` fields stay as aliases.
 - **Heartbeat ≤ 30s** (default 25s). Flush after every SSE frame using
   `http.NewResponseController(w).Flush()`.
 - **Reserved topics** (`docs`, `static`, `file`, `app`, `metrics`, `account`,

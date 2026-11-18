@@ -43,6 +43,9 @@ type fakeEvents struct {
 	streamCalls      int
 	subscribeCalls   int
 	unsubscribeCalls int
+
+	streamSubscriptionID    string
+	subscribeSubscriptionID string
 }
 
 func (f *fakeEvents) ListEvents() []EventDescriptor { return f.defs }
@@ -52,16 +55,18 @@ func (f *fakeEvents) PollEvents(_ context.Context, _ json.RawMessage) (any, erro
 	return f.pollResult, f.pollErr
 }
 
-func (f *fakeEvents) StreamEvents(ctx context.Context, raw json.RawMessage, emit func(Notification) error) error {
+func (f *fakeEvents) StreamEvents(ctx context.Context, raw json.RawMessage, subscriptionID string, emit func(Notification) error) error {
 	f.streamCalls++
+	f.streamSubscriptionID = subscriptionID
 	if f.stream != nil {
 		return f.stream(ctx, raw, emit)
 	}
 	return f.streamErr
 }
 
-func (f *fakeEvents) SubscribeEvents(ctx context.Context, raw json.RawMessage, respond func(any) error, emit func(Notification) error) error {
+func (f *fakeEvents) SubscribeEvents(ctx context.Context, raw json.RawMessage, subscriptionID string, respond func(any) error, emit func(Notification) error) error {
 	f.subscribeCalls++
+	f.subscribeSubscriptionID = subscriptionID
 	if f.subscribe != nil {
 		return f.subscribe(ctx, raw, respond, emit)
 	}
@@ -399,12 +404,15 @@ func TestEventsStreamPushRequiresSSE(t *testing.T) {
 	}
 
 	resp := &fakeResponder{sse: true}
-	_, rpcErr = srv.Handle(context.Background(), Request{Method: "events/stream", Params: json.RawMessage(`{}`)}, resp)
+	_, rpcErr = srv.Handle(context.Background(), Request{ID: json.RawMessage(`42`), Method: "events/stream", Params: json.RawMessage(`{}`)}, resp)
 	if rpcErr != nil {
 		t.Fatalf("stream: %v", rpcErr)
 	}
 	if len(resp.sent) != 1 || resp.sent[0].Method != "notifications/events/active" {
 		t.Fatalf("sent = %+v", resp.sent)
+	}
+	if events.streamSubscriptionID != "42" {
+		t.Fatalf("default subscription id = %q, want the request id", events.streamSubscriptionID)
 	}
 }
 
@@ -452,6 +460,9 @@ func TestEventsSubscribeRepliesThenStreams(t *testing.T) {
 	}
 	if len(resp.sent) != 2 || resp.sent[0].Method != "notifications/events/active" || resp.sent[1].Method != "notifications/events/event" {
 		t.Fatalf("sent = %+v", resp.sent)
+	}
+	if events.subscribeSubscriptionID != "7" {
+		t.Fatalf("default subscription id = %q, want the request id", events.subscribeSubscriptionID)
 	}
 }
 
